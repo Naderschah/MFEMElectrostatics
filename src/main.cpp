@@ -1,7 +1,6 @@
 #define MFEM_DEBUG
 #include "mfem.hpp"
 #include "load_mesh.h"
-#include "constants.h"
 #include "boundary_conditions.h"
 #include "solver.h"
 #include "ComputeElectricField.h"
@@ -17,12 +16,12 @@ int main(int argc, char *argv[])
     std::string config_path = "config/config.yaml";     
     auto cfg = std::make_shared<const Config>(
         Config::Load(config_path)
-    )
+    );
     std::cout << "[Config] Loading from: " << config_path << std::endl;
 
     // 1. Create the mesh
     Mesh* mesh = CreateSimulationDomain(cfg->mesh.path);
-    if (cfg.debug.debug)
+    if (cfg->debug.debug)
     {
         std::cout << "bdr_attributes Max=" << mesh->bdr_attributes.Max()
             << " list: ";
@@ -47,7 +46,7 @@ int main(int argc, char *argv[])
                 << mesh->GetNBE() << " boundary elements" << std::endl;
     }
     // 2. Create finite element collection and space
-    H1_FECollection fec(fe_order, mesh->Dimension());
+    H1_FECollection fec(cfg->solver.order, mesh->Dimension());
     FiniteElementSpace fespace(mesh, &fec);
 
     // 3. Get Dirichlet boundary attributes
@@ -70,9 +69,9 @@ int main(int argc, char *argv[])
     ComputeFieldMagnitude(E, Emag);  // computes |E| at nodes
 
     // 5. Save Data
-    mesh->Save(cfg->solver.mesh_save_path);
-    V.Save(cfg->solver.V_solution_path);
-    Emag.Save(cfg->solver.Emag_solution_path);
+    mesh->Save(cfg->solver.mesh_save_path.c_str());
+    V.Save(cfg->solver.V_solution_path.c_str());
+    Emag.Save(cfg->solver.Emag_solution_path.c_str());
 
 }
 

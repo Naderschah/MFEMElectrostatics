@@ -2,7 +2,6 @@
 #define GEOMETRY_H
 
 #include "mfem.hpp"
-#include "constants.h"
 
 using namespace mfem;
 

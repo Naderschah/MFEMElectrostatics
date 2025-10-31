@@ -1,0 +1,1 @@
+/usr/bin/c++ -rdynamic CMakeFiles/build_geometry.dir/main.o CMakeFiles/build_geometry.dir/partition_tools.o CMakeFiles/build_geometry.dir/debugging_things.o -o build_geometry  -lgmsh -lconfig 

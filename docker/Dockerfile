@@ -10,7 +10,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update && apt-get install -y --no-install-recommends \
     # --- Core build / system tools ---
     build-essential cmake git wget ca-certificates curl \
-    pkg-config unzip locales gfortran gdb vim-common \
+    pkg-config unzip locales gfortran gdb vim-common libyaml-cpp-dev \
     \
     # --- Python toolchain ---
     python3 python3-dev python3-pip python3-venv python3-wheel \

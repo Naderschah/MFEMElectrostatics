@@ -3,7 +3,7 @@
 #include <unordered_map>
 
 struct Boundary {
-    int id = -1;            // bdr_id
+    int bdr_id = -1;            // bdr_id
     std::string type;       // "dirichlet" | "neumann" | "robin"
     double value = 0.0;
 };
@@ -42,7 +42,7 @@ struct SolverSettings {
 };
 
 struct Config {
-    std::string mesh_path = "geometry.msh";
+    MeshSettings mesh;
     DeviceSettings device;
     DebugSettings  debug;
     SolverSettings solver;

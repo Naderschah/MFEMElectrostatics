@@ -66,10 +66,10 @@ Config Config::Load(const std::string& path) {
             std::string name = it.first.as<std::string>();
             auto node = it.second;
             Boundary b;
-            b.id    = node["bdr_id"].as<int>(-1);
+            b.bdr_id    = node["bdr_id"].as<int>(-1);
             b.type  = node["type"].as<std::string>("dirichlet");
             b.value = node["value"].as<double>(0.0);
-            if (b.id <= 0) {
+            if (b.bdr_id <= 0) {
                 throw std::runtime_error("Boundary '" + name + "' is missing a valid bdr_id");
             }
             cfg.boundaries[name] = b;

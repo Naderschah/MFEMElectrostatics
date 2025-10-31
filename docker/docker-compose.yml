@@ -1,8 +1,11 @@
 services:
   mfem-shell:
-    build: .
+    build:
+      context: .
+      network: host
     user: felix
     container_name: mfem_shell
+    network_mode: host # My OMARCHY install didnt compile with required kernel modules so this is fine 
     tty: true
     stdin_open: true
     command: bash
@@ -13,14 +16,17 @@ services:
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix:rw     # X11 socket
       - $HOME/.Xauthority:/home/felix/.Xauthority:ro  # X auth (if used)
-      - /home/felix/MFEM_ENV:/home/felix/work:rw,delegated
+      - /home/felix/MFEMElectrostatics:/home/felix/work:rw,delegated
     devices:
       - /dev/dri:/dev/dri                    # optional: hardware accel
 
 
   mfem-jupyter:
-    build: .
+    build:
+      context: .
+      network: host
     user: felix 
+    network_mode: host # My OMARCHY install didnt compile with required kernel modules so this is fine 
     container_name: mfem_jupyter
     ports:
       - "8888:8888"
@@ -31,7 +37,7 @@ services:
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix:rw     # X11 socket
       - $HOME/.Xauthority:/home/felix/.Xauthority:ro  # X auth (if used)
-      - /home/felix/MFEM_ENV:/home/felix/work:rw,delegated
+      - /home/felix/MFEMElectrostatics:/home/felix/work:rw,delegated
     devices:
       - /dev/dri:/dev/dri                    # optional: hardware accel
 

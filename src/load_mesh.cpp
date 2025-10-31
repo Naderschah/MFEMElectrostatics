@@ -1,4 +1,4 @@
-#include "load_geometry.h"
+#include "load_mesh.h"
 #include <iostream>
 
 Mesh* CreateSimulationDomain(std::string path)

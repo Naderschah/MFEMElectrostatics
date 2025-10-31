@@ -6,7 +6,7 @@
 #include <iostream>
 #include <sstream>
 #include <unordered_set>
-
+#include <memory>
 
 #include "geometry_constants.h" 
 #include "partition_tools.h" 
@@ -167,10 +167,15 @@ static int makeCylindricalSleeve(double zMin, double zMax,
 // -------------------------- Main ------------------------------
 
 int main() {
+  std::string config_path = "config/config.yaml";     
+  auto cfg = std::make_shared<const Config>(
+      Config::Load(config_path)
+  );
+  std::cout << "[Config] Loading from: " << config_path << std::endl;
+
   gmsh::initialize();
   gmsh::model::add("tpc_occ");
   // ---- Constants ----
-
   const double H     = DriftRegionHeight + 2 * ring_thickness;
   const double R     = outer_radius * 1.1;
   const double rWire = wire_diameter * 0.5;
@@ -201,7 +206,7 @@ int main() {
         ring_thickness, inner_radius, outer_radius,
         n_wires_anode, wire_diameter
     );
-    tpc::geom::registerTool(tools, "Anode", anode, /*surfBC=*/anode_BC_index, /*volBC=*/-1, &fluids, &cutters);
+    tpc::geom::registerTool(tools, "Anode", anode, /*surfBC=*/cfg.materials.at("Anode").bc_idx, /*volBC=*/-1, &fluids, &cutters);
   }
   if (USE_GATE) {
   const double gate_zBase       = gate_wire_height;                           // ring bottom
@@ -212,7 +217,14 @@ int main() {
       n_wires_gate, wire_diameter
   );
 
-  tpc::geom::registerTool(tools, "Gate", gate, /*surfBC=*/gate_BC_index, /*volBC=*/-1, &fluids, &cutters);
+  tpc::geom::registerTool(tools, "Gate", gate, /*surfBC=*/cfg.materials.at("Gate").bc_idx, /*volBC=*/-1, &fluids, &cutters);
+  }
+  if (USE_GATE) {
+  const double gate_zBase       = gate_wire_height;                           // ring bottom
+  const double gate_wireCenterZ = gate_zBase + ring_thickness - rWire - 0.005; // tiny nudge down
+  const int gate = makeParallelWireElectrodeAssembly(
+      0.0, 0.0, gate_zBase, gate_wireCenterZ,
+      ring_thickness, inner_radius, outer_radate_BC_index, /*volBC=*/-1, &fluids, &cutters);
   }
   // --- Cathode (wires at top extent: z_max - rWire) ---
   if (USE_CATHODE) {
@@ -223,7 +235,7 @@ int main() {
         ring_thickness, inner_radius, outer_radius,
         n_wires_cathode, wire_diameter
     );
-    tpc::geom::registerTool(tools, "Cathode", cathode, /*surfBC=*/cathode_BC_index, /*volBC=*/-1, &fluids, &cutters);
+    tpc::geom::registerTool(tools, "Cathode", cathode, /*surfBC=*/cfg.materials.at("Cathode").bc_idx, /*volBC=*/-1, &fluids, &cutters);
   }
 
   if (USE_PTFE)

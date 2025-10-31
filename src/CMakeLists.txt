@@ -23,11 +23,13 @@ add_executable(TPC
 
 target_link_libraries(TPC PRIVATE mfem config)
 target_include_directories(TPC PRIVATE ${CMAKE_SOURCE_DIR})
+find_package(yaml-cpp REQUIRED)
+target_link_libraries(TPC PRIVATE yaml-cpp)
 
 # ---------------------------------------------------------
 # --- Geometry (optional, separate build) -----------------
 # ---------------------------------------------------------
 # TODO Not sure how to handle this properly. Its not part of the solver
 # And will likely only be done to generate geometries
-add_subdirectory(geometry)
+# add_subdirectory(geometry)
 

@@ -1,9 +1,8 @@
 #include "solver.h"
-#include "constants.h"
 
 
 // Build ε(x) that is piecewise-constant over element attributes (volume tags)
-static PWConstCoefficient BuildEpsilonPWConst(const Mesh &mesh, const Config& cfg)
+static PWConstCoefficient BuildEpsilonPWConst(const Mesh &mesh, const std::shared_ptr<const Config>& cfg)
 {
     // attributes are 1-based; we need a vector sized by the max attribute id
     const int max_attr = mesh.attributes.Max();  // e.g. 2004 in your case
@@ -28,7 +27,8 @@ static PWConstCoefficient BuildEpsilonPWConst(const Mesh &mesh, const Config& cf
         // Fill in any remaining attributes that were not explicitly set
         for (int a = 1; a <= max_attr; ++a)
         {
-            if (eps_by_attr(a - 1) == epsilonDefault)  eps_by_attr(a - 1) = mat.epsilon_r;
+          // TODO Verify the logic + check if we want to actually do this 
+          if (eps_by_attr(a - 1) == 0.0)  eps_by_attr(a - 1) = mat.epsilon_r;
         }
       }
     }
@@ -36,7 +36,7 @@ static PWConstCoefficient BuildEpsilonPWConst(const Mesh &mesh, const Config& cf
     return PWConstCoefficient(eps_by_attr);
 }
 
-GridFunction SolvePoisson(FiniteElementSpace &fespace, const Array<int> &dirichlet_attr, const Config& cfg)
+GridFunction SolvePoisson(FiniteElementSpace &fespace, const Array<int> &dirichlet_attr, const std::shared_ptr<const Config>& cfg)
 {
     GridFunction V(&fespace);
     
@@ -65,10 +65,10 @@ GridFunction SolvePoisson(FiniteElementSpace &fespace, const Array<int> &dirichl
 
     // Solve with CG
     CGSolver cg;
-    cg.SetRelTol(0);
-    cg.SetAbsTol(tol);
-    cg.SetMaxIter(maxiter);
-    cg.SetPrintLevel(printlevel);
+    cg.SetRelTol(cfg->solver.rtol);
+    cg.SetAbsTol(cfg->solver.atol);
+    cg.SetMaxIter(cfg->solver.maxiter);
+    cg.SetPrintLevel(cfg->solver.printlevel);
 
     DSmoother prec(A);
     cg.SetPreconditioner(prec);

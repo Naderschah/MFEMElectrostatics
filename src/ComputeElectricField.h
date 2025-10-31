@@ -2,7 +2,6 @@
 #define COMPUTEELECTRICFIELD_H
 
 #include "mfem.hpp"
-#include "constants.h"
 using namespace mfem;
 
 void ComputeElectricField(GridFunction &V, GridFunction &E_y); 
