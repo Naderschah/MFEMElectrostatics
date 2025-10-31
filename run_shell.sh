@@ -1,2 +1,2 @@
-docker compose run -f ./docker/ --rm --build --service-ports mfem-shell
+docker compose run -f ./docker/docker-compose.yml --rm --build --service-ports mfem-shell
 
