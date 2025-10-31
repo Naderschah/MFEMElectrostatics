@@ -1,2 +1,0 @@
-rm -r * && cmake ../src/ && make && ./capacitor && glvis -m mesh.mesh -g solution.gf -k "AmaagcmRj"
-

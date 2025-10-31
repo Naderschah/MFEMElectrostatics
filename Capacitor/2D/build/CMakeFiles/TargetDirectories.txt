@@ -1,4 +1,0 @@
-/home/felix/work/Capacitor/2D/build/CMakeFiles/mesh.dir
-/home/felix/work/Capacitor/2D/build/CMakeFiles/capacitor.dir
-/home/felix/work/Capacitor/2D/build/CMakeFiles/edit_cache.dir
-/home/felix/work/Capacitor/2D/build/CMakeFiles/rebuild_cache.dir

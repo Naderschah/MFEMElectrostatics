@@ -1,1 +1,0 @@
-/usr/bin/c++ CMakeFiles/capacitor.dir/main.cpp.o CMakeFiles/capacitor.dir/geometry.cpp.o CMakeFiles/capacitor.dir/boundary_conditions.cpp.o CMakeFiles/capacitor.dir/solver.cpp.o CMakeFiles/capacitor.dir/ComputeElectricField.cpp.o -o capacitor  -lmfem 

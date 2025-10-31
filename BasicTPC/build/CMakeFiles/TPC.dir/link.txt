@@ -1,1 +1,0 @@
-/usr/bin/c++ CMakeFiles/TPC.dir/main.cpp.o CMakeFiles/TPC.dir/geometry.cpp.o CMakeFiles/TPC.dir/boundary_conditions.cpp.o CMakeFiles/TPC.dir/solver.cpp.o CMakeFiles/TPC.dir/ComputeElectricField.cpp.o -o TPC  -lmfem 
