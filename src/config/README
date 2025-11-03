@@ -1,0 +1,3 @@
+## Config
+
+Loads the yaml config, seperate module in case something else needs it

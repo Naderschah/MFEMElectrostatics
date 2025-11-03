@@ -1,5 +1,0 @@
-/home/felix/work/build/CMakeFiles/build_geometry.dir
-/home/felix/work/build/CMakeFiles/mesh_tpc.dir
-/home/felix/work/build/CMakeFiles/mesh.dir
-/home/felix/work/build/CMakeFiles/edit_cache.dir
-/home/felix/work/build/CMakeFiles/rebuild_cache.dir

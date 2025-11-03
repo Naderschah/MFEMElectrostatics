@@ -19,6 +19,7 @@ add_executable(TPC
   boundary_conditions.cpp
   solver.cpp
   ComputeElectricField.cpp
+  cmdLineParser.cpp
 )
 
 target_link_libraries(TPC PRIVATE mfem config)

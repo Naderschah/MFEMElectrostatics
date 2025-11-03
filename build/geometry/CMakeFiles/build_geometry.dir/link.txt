@@ -1,1 +1,0 @@
-/usr/bin/c++ CMakeFiles/build_geometry.dir/main.cpp.o CMakeFiles/build_geometry.dir/partition_tools.cpp.o CMakeFiles/build_geometry.dir/debugging_things.cpp.o -o ../build_geometry  /usr/lib/x86_64-linux-gnu/libgmsh.so ../config/libconfig.a 

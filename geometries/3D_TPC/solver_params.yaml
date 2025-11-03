@@ -1,0 +1,58 @@
+schema_version: 1
+geometry_id: tpc
+
+# Where the mesh is/should be produced
+# Unused at the moment 
+mesh:
+  path: geometry.msh 
+
+
+# Processing device TODO not implemented and will get extended
+device:
+  use_gpu: false
+  threads: 20
+
+debug:
+  debug: true
+  quick_mesh: true
+
+# solver configuration
+solver:
+  order: 3
+  atol: 1.0 
+  rtol: 0.0
+  maxiter: 100000
+  printlevel: 1
+  mesh_save_path: "simulation_mesh.msh"
+  V_solution_path: "solution_V.gf"
+  Emag_solution_path: "solution_Emag.gf"
+
+
+# Geometry specifics
+materials:
+  LXe:
+    attr_id: 2002
+    epsilon_r: 1.95
+  GXe:
+    attr_id: 2003
+    epsilon_r: 1.0
+  PTFE:
+    attr_id: 2004
+    epsilon_r: 2.1
+  Default: 
+    epsilon_r: 1.0
+
+boundaries:
+  Anode:
+    bdr_id: 1000
+    type: dirichlet
+    value: 1000.0
+  Gate:
+    bdr_id: 1001
+    type: dirichlet
+    value: 0.0
+  Cathode:
+    bdr_id: 1002
+    type: dirichlet
+    value: -1000.0
+
