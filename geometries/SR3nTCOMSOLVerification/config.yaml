@@ -1,0 +1,91 @@
+schema_version: 1
+geometry_id: SR3XENONnT
+
+# Where the mesh is/should be produced
+# FIXME Unused at the moment 
+mesh:
+  path: geometry.msh 
+
+
+# Processing device TODO 
+preset: threads                       # serial | threads | mpi | gpu | mpi+gpu | mpi+threads
+
+compute:
+  mpi:
+    enabled: false                    # true => use Par* classes, MPI_Init, etc.
+    ranks: auto                       # integer or "auto"
+    hostfile: null                    # optional path
+    repartition_after_refine: true
+
+  # All options here work and tested 
+  threads:
+    enabled: true                     # OpenMP 
+    num: -1                           # number of threads (always applies to meshing)
+    affinity: scatter                 # "compact" | "scatter" | "none"
+
+  device: 
+    type: none                        # "none" | "cuda" | "hip" | "occa" | "cpu"
+    id: auto                          # int / auto 
+    per_rank: 1                       # GPUs per MPI rank 
+
+# End processing device
+
+debug:
+  debug: false
+  quick_mesh: false
+
+# solver configuration
+solver:
+  axisymmetric: true                  # Maybe this should be a string but 2D and 3D are done by default
+  order: 3
+  # TODO 
+  assembly_mode: partial              # full | partial | matrix_free
+  solver: pcg                         # pcg | gmres | fmgres | direct
+  precond: boomerang                  # boomerang | jacobi | ilu | none | petsc_gamg
+  # End TODO 
+  atol: 1e-12
+  rtol: 0.0
+  maxiter: 100000
+  printlevel: 1
+  mesh_save_path: "simulation_mesh.msh"
+  # TODO Change to only use naming convention not each explicitly 
+  V_solution_path: "solution_V.gf"
+  Emag_solution_path: "solution_Emag.gf"
+
+
+# Geometry specifics
+materials:
+  LXe:
+    attr_id: 2002
+    epsilon_r: 1.95
+  GXe:
+    attr_id: 2003
+    epsilon_r: 1.0
+  PTFE:
+    attr_id: 2004
+    epsilon_r: 1.0
+
+boundaries:
+  TopPlate:
+    bdr_id: 1000
+    type: dirichlet
+    value: 1000.0
+  BottomPlate:
+    bdr_id: 1001
+    type: dirichlet
+    value: 0.0
+  TopScreen: 
+    bdr_id: 1002
+    type: dirichlet
+    value: 0
+  BottomScreen: 
+    bdr_id: 1003
+    type: dirichlet
+    value: 0
+
+  FieldShapingRing:
+    bdr_id: 1005 # TODO Need to implement a way to generate these
+    type: dirichlet
+    value: -1 
+  
+

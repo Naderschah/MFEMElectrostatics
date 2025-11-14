@@ -101,6 +101,14 @@ RUN git clone --depth 1 https://github.com/glvis/glvis.git /home/felix/glvis && 
     mkdir -p /home/felix/.local/bin && \
     cp glvis /home/felix/.local/bin/
 
+
+# Install MESH converter
+RUN git clone https://github.com/victorsndvg/FEconv.git /home/felix/FEconv && \
+    cd /home/felix/FEconv && \
+    make -f Makefile.gfortran.linux
+
+ENV PATH="/home/felix/FEconv:${PATH}"
+
 WORKDIR /home/felix/work
 EXPOSE 8888
 
