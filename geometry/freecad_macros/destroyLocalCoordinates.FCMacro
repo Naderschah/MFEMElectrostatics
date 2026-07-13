@@ -1,0 +1,223 @@
+import FreeCAD as App
+import FreeCADGui as Gui
+
+# ============================================================
+# OPTIONS
+# ============================================================
+
+PREFIX = ""
+
+ONLY_LEAF_SHAPES = True
+ONLY_OBJECTS_WITH_SOLIDS = True
+
+HIDE_ORIGINAL_OBJECTS = True
+
+# Keep this False until you visually verify the FLAT_* objects.
+DELETE_SELECTED_ROOTS_AFTER_SUCCESS = False
+
+# Remove created FLAT_* objects from parent containers/groups,
+# so they are actually top-level document objects.
+FORCE_TOP_LEVEL = True
+
+# ============================================================
+
+doc = App.ActiveDocument
+
+if doc is None:
+    raise RuntimeError("No active document.")
+
+roots = Gui.Selection.getSelection()
+
+if not roots:
+    raise RuntimeError("Select the assembly/container/body objects you want to flatten.")
+
+def has_shape(obj):
+    return hasattr(obj, "Shape") and obj.Shape is not None and not obj.Shape.isNull()
+
+def children_of(obj):
+    kids = []
+
+    if hasattr(obj, "Group"):
+        try:
+            kids.extend(list(obj.Group))
+        except Exception:
+            pass
+
+    try:
+        for c in obj.OutList:
+            if c not in kids:
+                kids.append(c)
+    except Exception:
+        pass
+
+    return kids
+
+def has_shaped_descendant(obj):
+    try:
+        for c in obj.OutListRecursive:
+            if c is not obj and has_shape(c):
+                return True
+    except Exception:
+        pass
+    return False
+
+def collect_targets(obj, out, seen):
+    if obj.Name in seen:
+        return
+
+    seen.add(obj.Name)
+
+    for c in children_of(obj):
+        collect_targets(c, out, seen)
+
+    if not has_shape(obj):
+        return
+
+    if ONLY_LEAF_SHAPES and has_shaped_descendant(obj):
+        return
+
+    if ONLY_OBJECTS_WITH_SOLIDS and len(obj.Shape.Solids) < 1:
+        return
+
+    out.append(obj)
+
+def remove_from_parent_containers(obj):
+    for parent in list(obj.InList):
+        try:
+            if hasattr(parent, "removeObject"):
+                parent.removeObject(obj)
+        except Exception:
+            pass
+
+def safe_label(s):
+    return str(s).replace("\n", " ").strip()
+
+# Try to avoid creating new objects inside an active Part/Body.
+try:
+    Gui.ActiveDocument.resetEdit()
+except Exception:
+    pass
+
+try:
+    Gui.ActiveDocument.ActiveView.setActiveObject("part", None)
+except Exception:
+    pass
+
+targets = []
+seen = set()
+
+for root in roots:
+    collect_targets(root, targets, seen)
+
+# Deduplicate while preserving order.
+dedup = []
+seen_names = set()
+
+for obj in targets:
+    if obj.Name not in seen_names:
+        dedup.append(obj)
+        seen_names.add(obj.Name)
+
+targets = dedup
+
+if not targets:
+    raise RuntimeError("No shape leaf objects with solids found under the selection.")
+
+print("")
+print("============================================================")
+print("FLATTEN TO TOP LEVEL BY TRANSFORMED COPY")
+print("============================================================")
+print("Selected roots:", len(roots))
+for r in roots:
+    print("  root:", r.Name, "|", r.Label)
+
+print("Targets:", len(targets))
+for i, t in enumerate(targets, start=1):
+    print("  %04d | %s | %s | solids=%d faces=%d" % (
+        i, t.Name, t.Label, len(t.Shape.Solids), len(t.Shape.Faces)
+    ))
+
+created = []
+failed = []
+
+doc.openTransaction("Flatten assembly to top-level transformed copies")
+
+try:
+    for i, obj in enumerate(targets, start=1):
+        before = set(o.Name for o in doc.Objects)
+
+        Gui.Selection.clearSelection()
+        Gui.Selection.addSelection(doc.Name, obj.Name)
+
+        try:
+            Gui.runCommand("Part_TransformedCopy", 0)
+            doc.recompute()
+        except Exception as e:
+            failed.append((obj, repr(e)))
+            continue
+
+        after = [o for o in doc.Objects if o.Name not in before]
+        shaped_after = [o for o in after if has_shape(o)]
+
+        if not shaped_after:
+            failed.append((obj, "Part_TransformedCopy created no shaped object"))
+            continue
+
+        # Usually exactly one object.
+        new = shaped_after[-1]
+
+        new.Label = PREFIX + safe_label(obj.Label)
+
+        if FORCE_TOP_LEVEL:
+            remove_from_parent_containers(new)
+
+        try:
+            new.ViewObject.Visibility = True
+        except Exception:
+            pass
+
+        created.append((obj, new))
+
+        print("created:", new.Name, "|", new.Label, "from", obj.Name, "|", obj.Label)
+
+    if HIDE_ORIGINAL_OBJECTS:
+        for obj in targets:
+            try:
+                obj.ViewObject.Visibility = False
+            except Exception:
+                pass
+
+    if DELETE_SELECTED_ROOTS_AFTER_SUCCESS and not failed:
+        for root in roots:
+            try:
+                doc.removeObject(root.Name)
+            except Exception as e:
+                print("Could not delete root:", root.Name, repr(e))
+
+    doc.commitTransaction()
+    doc.recompute()
+
+except Exception:
+    doc.abortTransaction()
+    raise
+
+Gui.Selection.clearSelection()
+
+for old, new in created:
+    try:
+        Gui.Selection.addSelection(doc.Name, new.Name)
+    except Exception:
+        pass
+
+print("")
+print("Result:")
+print("  created:", len(created))
+print("  failed:", len(failed))
+
+if failed:
+    print("")
+    print("Failures:")
+    for obj, reason in failed:
+        print("  -", obj.Name, "|", obj.Label, "|", reason)
+
+print("============================================================")

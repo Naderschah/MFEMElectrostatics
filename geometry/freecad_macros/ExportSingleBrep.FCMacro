@@ -1,0 +1,286 @@
+import FreeCAD as App
+import FreeCADGui as Gui
+import Part
+import os
+import re
+
+try:
+    from PySide2 import QtWidgets
+except Exception:
+    try:
+        from PySide import QtWidgets
+    except Exception:
+        from PySide import QtGui as QtWidgets
+
+# ============================================================
+# OPTIONS
+# ============================================================
+
+ONLY_LEAF_SHAPES = True
+ONLY_OBJECTS_WITH_SOLIDS = False
+
+# Important for your global-frame workflow:
+# True = uses temporary Part_TransformedCopy objects, then deletes them.
+USE_TEMP_TRANSFORMED_COPY_FOR_GLOBAL_FRAME = True
+
+BREP_EXTENSION = ".brep"
+
+# ============================================================
+
+doc = App.ActiveDocument
+
+if doc is None:
+    raise RuntimeError("No active document.")
+
+sel = Gui.Selection.getSelection()
+
+if len(sel) != 1:
+    raise RuntimeError("Select exactly one App::Part.")
+
+part_obj = sel[0]
+
+if getattr(part_obj, "TypeId", "") != "App::Part":
+    raise RuntimeError("Selected object is not an App::Part: " + part_obj.Label)
+
+def is_app_part(obj):
+    return getattr(obj, "TypeId", "") == "App::Part"
+
+def has_shape(obj):
+    if not hasattr(obj, "Shape"):
+        return False
+    try:
+        sh = obj.Shape
+        return sh is not None and not sh.isNull()
+    except Exception:
+        return False
+
+def solid_count(obj):
+    try:
+        return len(obj.Shape.Solids)
+    except Exception:
+        return 0
+
+def children_of(obj):
+    out = []
+
+    if hasattr(obj, "Group"):
+        try:
+            out.extend(list(obj.Group))
+        except Exception:
+            pass
+
+    try:
+        for c in obj.OutList:
+            if c not in out:
+                out.append(c)
+    except Exception:
+        pass
+
+    return out
+
+def has_shaped_descendant(obj):
+    try:
+        for c in obj.OutListRecursive:
+            if c is not obj and has_shape(c):
+                return True
+    except Exception:
+        pass
+    return False
+
+def collect_shape_targets(obj, out, seen):
+    if obj.Name in seen:
+        return
+
+    seen.add(obj.Name)
+
+    for c in children_of(obj):
+        collect_shape_targets(c, out, seen)
+
+    if not has_shape(obj):
+        return
+
+    if ONLY_LEAF_SHAPES and has_shaped_descendant(obj):
+        return
+
+    if ONLY_OBJECTS_WITH_SOLIDS and solid_count(obj) < 1:
+        return
+
+    out.append(obj)
+
+def get_shape_targets_for_part(part_obj):
+    targets = []
+    seen = set()
+
+    for c in children_of(part_obj):
+        collect_shape_targets(c, targets, seen)
+
+    dedup = []
+    seen_names = set()
+
+    for obj in targets:
+        if obj.Name not in seen_names:
+            dedup.append(obj)
+            seen_names.add(obj.Name)
+
+    return dedup
+
+def sanitize_filename(s):
+    s = str(s).strip()
+    s = re.sub(r"[\\\\/:*?\\\"<>|]+", "_", s)
+    s = re.sub(r"\\s+", "_", s)
+    s = re.sub(r"_+", "_", s)
+    s = s.strip("._ ")
+
+    if not s:
+        s = "unnamed"
+
+    return s[:180]
+
+def choose_brep_path(default_name):
+    default_name = sanitize_filename(default_name)
+
+    if not default_name.lower().endswith(BREP_EXTENSION):
+        default_name += BREP_EXTENSION
+
+    suggested = os.path.join(os.path.expanduser("~"), default_name)
+
+    result = QtWidgets.QFileDialog.getSaveFileName(
+        None,
+        "Save selected App::Part as BREP",
+        suggested,
+        "BREP files (*.brep);;All files (*)"
+    )
+
+    if isinstance(result, tuple):
+        path = result[0]
+    else:
+        path = result
+
+    path = str(path).strip()
+
+    if not path:
+        raise RuntimeError("No export path selected.")
+
+    if not path.lower().endswith(BREP_EXTENSION):
+        path += BREP_EXTENSION
+
+    return path
+
+def direct_global_shape_copy(obj):
+    sh = obj.Shape.copy()
+
+    try:
+        gp = obj.getGlobalPlacement()
+        sh.Placement = gp.multiply(sh.Placement)
+        return sh
+    except Exception:
+        pass
+
+    try:
+        sh.Placement = obj.Placement.multiply(sh.Placement)
+    except Exception:
+        pass
+
+    return sh
+
+def transformed_copy_shape(obj):
+    before = set(o.Name for o in doc.Objects)
+
+    Gui.Selection.clearSelection()
+    Gui.Selection.addSelection(doc.Name, obj.Name)
+
+    try:
+        Gui.runCommand("Part_TransformedCopy", 0)
+        doc.recompute()
+    except Exception as e:
+        raise RuntimeError("Part_TransformedCopy failed for " + obj.Name + ": " + repr(e))
+
+    after = [o for o in doc.Objects if o.Name not in before]
+    shaped_after = [o for o in after if has_shape(o)]
+
+    if not shaped_after:
+        for temp in reversed(after):
+            try:
+                doc.removeObject(temp.Name)
+            except Exception:
+                pass
+
+        raise RuntimeError("Part_TransformedCopy created no shaped object for " + obj.Name)
+
+    temp_obj = shaped_after[-1]
+
+    try:
+        sh = temp_obj.Shape.copy()
+    finally:
+        for temp in reversed(after):
+            try:
+                doc.removeObject(temp.Name)
+            except Exception:
+                pass
+
+    return sh
+
+# Avoid accidental insertion into an active Part/Body.
+try:
+    Gui.ActiveDocument.resetEdit()
+except Exception:
+    pass
+
+try:
+    Gui.ActiveDocument.ActiveView.setActiveObject("part", None)
+except Exception:
+    pass
+
+doc.recompute()
+
+targets = get_shape_targets_for_part(part_obj)
+
+if not targets:
+    raise RuntimeError("No shaped child objects found under selected App::Part: " + part_obj.Label)
+
+print("")
+print("============================================================")
+print("SINGLE APP::PART BREP EXPORT")
+print("============================================================")
+print("Selected App::Part:", part_obj.Name, "|", part_obj.Label)
+print("Shape targets:", len(targets))
+
+shapes = []
+
+for i, obj in enumerate(targets, start=1):
+    print("  %04d | %s | %s | solids=%d" % (
+        i,
+        obj.Name,
+        obj.Label,
+        solid_count(obj)
+    ))
+
+    if USE_TEMP_TRANSFORMED_COPY_FOR_GLOBAL_FRAME:
+        sh = transformed_copy_shape(obj)
+    else:
+        sh = direct_global_shape_copy(obj)
+
+    shapes.append(sh)
+
+if len(shapes) == 1:
+    export_shape = shapes[0]
+else:
+    export_shape = Part.makeCompound(shapes)
+
+path = choose_brep_path(part_obj.Label)
+
+export_shape.exportBrep(path)
+
+Gui.Selection.clearSelection()
+
+try:
+    Gui.Selection.addSelection(doc.Name, part_obj.Name)
+except Exception:
+    pass
+
+print("")
+print("Exported:")
+print("  App::Part:", part_obj.Label)
+print("  BREP:", path)
+print("  Leaf shapes:", len(targets))
+print("============================================================")

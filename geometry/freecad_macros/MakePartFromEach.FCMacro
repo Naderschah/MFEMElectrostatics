@@ -1,0 +1,396 @@
+import re
+import FreeCAD as App
+import FreeCADGui as Gui
+
+try:
+    from PySide2 import QtWidgets
+except Exception:
+    from PySide import QtGui as QtWidgets
+
+# ============================================================
+# OPTIONS
+# ============================================================
+
+SORT_BY_LABEL = False
+
+ONLY_LEAF_SHAPES = True
+ONLY_OBJECTS_WITH_SOLIDS = True
+
+# Delete the original selected objects/containers after all copies succeed.
+DELETE_ORIGINAL_SELECTED_ROOTS_AFTER_SUCCESS = True
+
+# Safer behavior: do not delete anything if any transformed copy fails.
+DELETE_ONLY_IF_NO_FAILURES = True
+
+# Indexing behavior:
+# False = continue after the highest existing index.
+# True  = fill the first available missing index gaps.
+FILL_INDEX_GAPS = False
+
+# ============================================================
+
+doc = App.ActiveDocument
+
+if not doc:
+    raise RuntimeError("No active FreeCAD document.")
+
+sel = Gui.Selection.getSelection()
+
+if not sel:
+    raise RuntimeError("Select one or more objects first.")
+
+base_name, ok = QtWidgets.QInputDialog.getText(
+    None,
+    "Create Indexed Parts",
+    "Base name for new Parts:"
+)
+
+base_name = str(base_name).strip()
+
+if not ok or not base_name:
+    raise RuntimeError("No name entered. Cancelled.")
+
+roots = list(sel)
+
+if SORT_BY_LABEL:
+    roots.sort(key=lambda o: getattr(o, "Label", getattr(o, "Name", "")))
+
+def existing_indices_for_base(base):
+    pattern = re.compile(r"^" + re.escape(base) + r"(\\d{3})$")
+
+    indices = set()
+
+    for obj in doc.Objects:
+        candidates = [
+            getattr(obj, "Label", ""),
+            getattr(obj, "Name", "")
+        ]
+
+        for candidate in candidates:
+            m = pattern.match(str(candidate))
+            if m:
+                indices.add(int(m.group(1)))
+
+    return indices
+
+def allocate_indices(base, count):
+    existing = existing_indices_for_base(base)
+
+    if not existing:
+        return list(range(count)), existing
+
+    if not FILL_INDEX_GAPS:
+        start = max(existing) + 1
+        return list(range(start, start + count)), existing
+
+    allocated = []
+    idx = 0
+
+    while len(allocated) < count:
+        if idx not in existing and idx not in allocated:
+            allocated.append(idx)
+        idx += 1
+
+    return allocated, existing
+
+assigned_indices, existing_indices = allocate_indices(base_name, len(roots))
+
+def has_shape(obj):
+    return hasattr(obj, "Shape") and obj.Shape is not None and not obj.Shape.isNull()
+
+def children_of(obj):
+    kids = []
+
+    if hasattr(obj, "Group"):
+        try:
+            kids.extend(list(obj.Group))
+        except Exception:
+            pass
+
+    try:
+        for c in obj.OutList:
+            if c not in kids:
+                kids.append(c)
+    except Exception:
+        pass
+
+    return kids
+
+def has_shaped_descendant(obj):
+    try:
+        for c in obj.OutListRecursive:
+            if c is not obj and has_shape(c):
+                return True
+    except Exception:
+        pass
+
+    return False
+
+def collect_targets(obj, out, seen):
+    if obj.Name in seen:
+        return
+
+    seen.add(obj.Name)
+
+    for c in children_of(obj):
+        collect_targets(c, out, seen)
+
+    if not has_shape(obj):
+        return
+
+    if ONLY_LEAF_SHAPES and has_shaped_descendant(obj):
+        return
+
+    if ONLY_OBJECTS_WITH_SOLIDS and len(obj.Shape.Solids) < 1:
+        return
+
+    out.append(obj)
+
+def get_targets_for_root(root):
+    targets = []
+    seen = set()
+    collect_targets(root, targets, seen)
+
+    dedup = []
+    seen_names = set()
+
+    for obj in targets:
+        if obj.Name not in seen_names:
+            dedup.append(obj)
+            seen_names.add(obj.Name)
+
+    return dedup
+
+def remove_from_parent_containers(obj):
+    for parent in list(obj.InList):
+        try:
+            if hasattr(parent, "removeObject"):
+                parent.removeObject(obj)
+        except Exception:
+            pass
+
+def preserve_global_placement(obj):
+    if hasattr(obj, "getGlobalPlacement"):
+        try:
+            return obj.getGlobalPlacement()
+        except Exception:
+            return None
+    return None
+
+def restore_global_placement(obj, placement):
+    if placement is not None and hasattr(obj, "setGlobalPlacement"):
+        try:
+            obj.setGlobalPlacement(placement)
+        except Exception:
+            pass
+
+def collect_delete_candidates(root, out, seen):
+    if root.Name in seen:
+        return
+
+    seen.add(root.Name)
+
+    for c in children_of(root):
+        collect_delete_candidates(c, out, seen)
+
+    out.append(root)
+
+def delete_original_roots(roots, protected_names):
+    delete_list = []
+    seen = set()
+
+    for root in roots:
+        collect_delete_candidates(root, delete_list, seen)
+
+    deleted = []
+    skipped = []
+
+    for obj in delete_list:
+        if obj.Name in protected_names:
+            skipped.append(obj)
+            continue
+
+        try:
+            doc.removeObject(obj.Name)
+            deleted.append(obj)
+        except Exception as e:
+            skipped.append(obj)
+            print("Could not delete:", obj.Name, "|", obj.Label, "|", repr(e))
+
+    return deleted, skipped
+
+# Try to avoid creating transformed copies inside an active Part/Body.
+try:
+    Gui.ActiveDocument.resetEdit()
+except Exception:
+    pass
+
+try:
+    Gui.ActiveDocument.ActiveView.setActiveObject("part", None)
+except Exception:
+    pass
+
+root_target_pairs = []
+
+for root in roots:
+    targets = get_targets_for_root(root)
+    root_target_pairs.append((root, targets))
+
+if not any(targets for root, targets in root_target_pairs):
+    raise RuntimeError("No shape leaf objects with solids found under the selection.")
+
+print("")
+print("============================================================")
+print("CREATE INDEXED APP::PARTS WITH GLOBAL-FRAME COPIES")
+print("CONTINUING EXISTING INDICES")
+print("AND DELETE ORIGINAL SELECTED ROOTS AFTER SUCCESS")
+print("============================================================")
+print("Base name:", base_name)
+print("Selected roots:", len(roots))
+
+if existing_indices:
+    print("Existing index range:", min(existing_indices), "to", max(existing_indices))
+    print("Next assigned indices:", assigned_indices[0], "to", assigned_indices[-1])
+else:
+    print("No existing indexed parts found for this base name.")
+    print("Starting at index 000.")
+
+for list_idx, (root, targets) in enumerate(root_target_pairs):
+    real_idx = assigned_indices[list_idx]
+    part_label = f"{base_name}{real_idx:03d}"
+
+    print("")
+    print(f"{part_label} <- {root.Name} | {root.Label}")
+    print("  targets:", len(targets))
+
+    for i, t in enumerate(targets, start=1):
+        print("    %04d | %s | %s | solids=%d faces=%d" % (
+            i,
+            t.Name,
+            t.Label,
+            len(t.Shape.Solids),
+            len(t.Shape.Faces)
+        ))
+
+created_parts = []
+created_copies = []
+failed = []
+deleted = []
+skipped_delete = []
+
+doc.openTransaction("Create indexed App::Parts with flattened global copies and delete originals")
+
+try:
+    for list_idx, (root, targets) in enumerate(root_target_pairs):
+        real_idx = assigned_indices[list_idx]
+        part_label = f"{base_name}{real_idx:03d}"
+
+        part = doc.addObject("App::Part", part_label)
+        part.Label = part_label
+        created_parts.append((part, root))
+
+        try:
+            Gui.ActiveDocument.ActiveView.setActiveObject("part", None)
+        except Exception:
+            pass
+
+        if not targets:
+            failed.append((root, "No shape leaf objects with solids found under this selected root"))
+            continue
+
+        for obj in targets:
+            before = set(o.Name for o in doc.Objects)
+
+            Gui.Selection.clearSelection()
+            Gui.Selection.addSelection(doc.Name, obj.Name)
+
+            try:
+                Gui.runCommand("Part_TransformedCopy", 0)
+                doc.recompute()
+            except Exception as e:
+                failed.append((obj, repr(e)))
+                continue
+
+            after = [o for o in doc.Objects if o.Name not in before]
+            shaped_after = [o for o in after if has_shape(o)]
+
+            if not shaped_after:
+                failed.append((obj, "Part_TransformedCopy created no shaped object"))
+                continue
+
+            new = shaped_after[-1]
+
+            try:
+                new.Label = str(obj.Label)
+            except Exception:
+                pass
+
+            remove_from_parent_containers(new)
+
+            gp = preserve_global_placement(new)
+
+            part.addObject(new)
+
+            restore_global_placement(new, gp)
+
+            try:
+                new.ViewObject.Visibility = True
+            except Exception:
+                pass
+
+            created_copies.append((part, obj, new))
+
+            print("created/moved:", part.Label, "<-", new.Name, "|", new.Label, "from", obj.Name, "|", obj.Label)
+
+    should_delete = DELETE_ORIGINAL_SELECTED_ROOTS_AFTER_SUCCESS
+
+    if DELETE_ONLY_IF_NO_FAILURES and failed:
+        should_delete = False
+
+    if should_delete:
+        protected_names = set()
+
+        for part, root in created_parts:
+            protected_names.add(part.Name)
+
+        for part, old, new in created_copies:
+            protected_names.add(new.Name)
+
+        deleted, skipped_delete = delete_original_roots(roots, protected_names)
+
+    doc.commitTransaction()
+    doc.recompute()
+
+except Exception:
+    doc.abortTransaction()
+    raise
+
+Gui.Selection.clearSelection()
+
+for part, root in created_parts:
+    try:
+        Gui.Selection.addSelection(doc.Name, part.Name)
+    except Exception:
+        pass
+
+print("")
+print("Result:")
+print("  indexed App::Part containers created:", len(created_parts))
+print("  flattened copies moved into parts:", len(created_copies))
+print("  copy failures:", len(failed))
+print("  originals deleted:", len(deleted))
+print("  delete skipped/failed:", len(skipped_delete))
+
+if failed:
+    print("")
+    print("Copy failures:")
+    for obj, reason in failed:
+        print("  -", obj.Name, "|", obj.Label, "|", reason)
+
+if skipped_delete:
+    print("")
+    print("Delete skipped/failed:")
+    for obj in skipped_delete:
+        print("  -", obj.Name, "|", obj.Label)
+
+print("============================================================")

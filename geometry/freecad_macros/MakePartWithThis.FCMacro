@@ -1,0 +1,326 @@
+import FreeCAD as App
+import FreeCADGui as Gui
+
+try:
+    from PySide2 import QtWidgets
+except Exception:
+    from PySide import QtGui as QtWidgets
+
+# ============================================================
+# OPTIONS
+# ============================================================
+
+ONLY_LEAF_SHAPES = True
+ONLY_OBJECTS_WITH_SOLIDS = False
+
+# Delete the original selected objects/containers after all transformed copies succeed.
+DELETE_ORIGINAL_SELECTED_ROOTS_AFTER_SUCCESS = True
+
+# If any transformed copy fails, abort the whole operation.
+ABORT_IF_ANY_COPY_FAILURE = True
+
+# ============================================================
+
+doc = App.ActiveDocument
+
+if not doc:
+    raise RuntimeError("No active FreeCAD document.")
+
+roots = Gui.Selection.getSelection()
+
+if not roots:
+    raise RuntimeError("Select one or more objects first.")
+
+name, ok = QtWidgets.QInputDialog.getText(
+    None,
+    "New Part",
+    "Name for new Part:"
+)
+
+name = str(name).strip()
+
+if not ok or not name:
+    raise RuntimeError("No name entered. Cancelled.")
+
+def has_shape(obj):
+    return hasattr(obj, "Shape") and obj.Shape is not None and not obj.Shape.isNull()
+
+def children_of(obj):
+    kids = []
+
+    if hasattr(obj, "Group"):
+        try:
+            kids.extend(list(obj.Group))
+        except Exception:
+            pass
+
+    try:
+        for c in obj.OutList:
+            if c not in kids:
+                kids.append(c)
+    except Exception:
+        pass
+
+    return kids
+
+def has_shaped_descendant(obj):
+    try:
+        for c in obj.OutListRecursive:
+            if c is not obj and has_shape(c):
+                return True
+    except Exception:
+        pass
+
+    return False
+
+def collect_targets(obj, out, seen):
+    if obj.Name in seen:
+        return
+
+    seen.add(obj.Name)
+
+    for c in children_of(obj):
+        collect_targets(c, out, seen)
+
+    if not has_shape(obj):
+        return
+
+    if ONLY_LEAF_SHAPES and has_shaped_descendant(obj):
+        return
+
+    if ONLY_OBJECTS_WITH_SOLIDS and len(obj.Shape.Solids) < 1:
+        return
+
+    out.append(obj)
+
+def remove_from_parent_containers(obj):
+    for parent in list(obj.InList):
+        try:
+            if hasattr(parent, "removeObject"):
+                parent.removeObject(obj)
+        except Exception:
+            pass
+
+def preserve_global_placement(obj):
+    if hasattr(obj, "getGlobalPlacement"):
+        try:
+            return obj.getGlobalPlacement()
+        except Exception:
+            return None
+    return None
+
+def restore_global_placement(obj, placement):
+    if placement is not None and hasattr(obj, "setGlobalPlacement"):
+        try:
+            obj.setGlobalPlacement(placement)
+        except Exception:
+            pass
+
+def collect_delete_candidates(root, out, seen):
+    if root.Name in seen:
+        return
+
+    seen.add(root.Name)
+
+    for c in children_of(root):
+        collect_delete_candidates(c, out, seen)
+
+    # Children first, parent last.
+    out.append(root)
+
+def delete_original_roots(roots, protected_names):
+    delete_list = []
+    seen = set()
+
+    for root in roots:
+        collect_delete_candidates(root, delete_list, seen)
+
+    deleted = []
+    skipped = []
+
+    for obj in delete_list:
+        if obj.Name in protected_names:
+            skipped.append((obj, "protected"))
+            continue
+
+        try:
+            doc.removeObject(obj.Name)
+            deleted.append(obj)
+        except Exception as e:
+            skipped.append((obj, repr(e)))
+
+    return deleted, skipped
+
+# Try to avoid creating transformed copies inside an active Part/Body.
+try:
+    Gui.ActiveDocument.resetEdit()
+except Exception:
+    pass
+
+try:
+    Gui.ActiveDocument.ActiveView.setActiveObject("part", None)
+except Exception:
+    pass
+
+targets = []
+seen = set()
+
+for root in roots:
+    collect_targets(root, targets, seen)
+
+# Deduplicate while preserving order.
+dedup = []
+seen_names = set()
+
+for obj in targets:
+    if obj.Name not in seen_names:
+        dedup.append(obj)
+        seen_names.add(obj.Name)
+
+targets = dedup
+
+if not targets:
+    raise RuntimeError("No shape leaf objects with solids found under the selection.")
+
+print("")
+print("============================================================")
+print("FLATTEN SELECTED OBJECTS INTO NEW APP::PART")
+print("AND DELETE ORIGINAL SELECTED ROOTS AFTER SUCCESS")
+print("============================================================")
+print("New Part:", name)
+print("Selected roots:", len(roots))
+print("Flatten/move targets:", len(targets))
+
+for i, t in enumerate(targets, start=1):
+    print("  %04d | %s | %s | solids=%d faces=%d" % (
+        i,
+        t.Name,
+        t.Label,
+        len(t.Shape.Solids),
+        len(t.Shape.Faces)
+    ))
+
+created = []
+failed = []
+deleted = []
+skipped_delete = []
+
+doc.openTransaction("Flatten selected objects into new App::Part and delete originals")
+
+try:
+    # Create the top-level yellow Std Part / App::Part container.
+    part = doc.addObject("App::Part", name)
+    part.Label = name
+
+    # Make sure the new part does not accidentally become the active insertion target.
+    try:
+        Gui.ActiveDocument.ActiveView.setActiveObject("part", None)
+    except Exception:
+        pass
+
+    for obj in targets:
+        before = set(o.Name for o in doc.Objects)
+
+        Gui.Selection.clearSelection()
+        Gui.Selection.addSelection(doc.Name, obj.Name)
+
+        try:
+            Gui.runCommand("Part_TransformedCopy", 0)
+            doc.recompute()
+        except Exception as e:
+            failed.append((obj, repr(e)))
+            continue
+
+        after = [o for o in doc.Objects if o.Name not in before]
+        shaped_after = [o for o in after if has_shape(o)]
+
+        if not shaped_after:
+            failed.append((obj, "Part_TransformedCopy created no shaped object"))
+            continue
+
+        # Usually exactly one object.
+        new = shaped_after[-1]
+
+        # Keep source label for export readability.
+        try:
+            new.Label = str(obj.Label)
+        except Exception:
+            pass
+
+        # Ensure transformed copy is top-level before placing it into the new Part.
+        remove_from_parent_containers(new)
+
+        # Preserve the flattened/global placement through the container move.
+        gp = preserve_global_placement(new)
+
+        part.addObject(new)
+
+        restore_global_placement(new, gp)
+
+        try:
+            new.ViewObject.Visibility = True
+        except Exception:
+            pass
+
+        created.append((obj, new))
+
+        print("created/moved:", new.Name, "|", new.Label, "from", obj.Name, "|", obj.Label)
+
+    if failed and ABORT_IF_ANY_COPY_FAILURE:
+        print("")
+        print("Copy failure detected. Aborting. Originals will not be deleted.")
+        for obj, reason in failed:
+            print("  -", obj.Name, "|", obj.Label, "|", reason)
+        raise RuntimeError("Aborted because one or more transformed copies failed.")
+
+    if DELETE_ORIGINAL_SELECTED_ROOTS_AFTER_SUCCESS:
+        protected_names = set()
+        protected_names.add(part.Name)
+
+        for old, new in created:
+            protected_names.add(new.Name)
+
+        deleted, skipped_delete = delete_original_roots(roots, protected_names)
+
+        if skipped_delete:
+            print("")
+            print("Some originals were not deleted:")
+            for obj, reason in skipped_delete:
+                print("  -", obj.Name, "|", obj.Label, "|", reason)
+
+    doc.commitTransaction()
+    doc.recompute()
+
+except Exception:
+    doc.abortTransaction()
+    raise
+
+Gui.Selection.clearSelection()
+
+try:
+    Gui.Selection.addSelection(doc.Name, part.Name)
+except Exception:
+    pass
+
+print("")
+print("Result:")
+print("  App::Part:", part.Label)
+print("  flattened copies moved into part:", len(created))
+print("  copy failures:", len(failed))
+print("  originals deleted:", len(deleted))
+print("  delete skipped/failed:", len(skipped_delete))
+
+if failed:
+    print("")
+    print("Copy failures:")
+    for obj, reason in failed:
+        print("  -", obj.Name, "|", obj.Label, "|", reason)
+
+if skipped_delete:
+    print("")
+    print("Delete skipped/failed:")
+    for obj, reason in skipped_delete:
+        print("  -", obj.Name, "|", obj.Label, "|", reason)
+
+print("============================================================")
+

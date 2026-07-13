@@ -1,0 +1,544 @@
+import FreeCAD as App
+import FreeCADGui as Gui
+import Part
+import os
+import re
+import csv
+from datetime import datetime
+
+try:
+    from PySide2 import QtWidgets
+except Exception:
+    try:
+        from PySide import QtWidgets
+    except Exception:
+        from PySide import QtGui as QtWidgets
+
+# ============================================================
+# OPTIONS
+# ============================================================
+
+PROCESS_SELECTION_IF_ANY = True
+PROCESS_SELECTION_DESCENDANT_PARTS = True
+
+# Export only App::Parts that do not contain other App::Parts.
+# This avoids exporting both a parent container and its child export groups.
+ONLY_LEAF_APP_PARTS = True
+
+# Inside each App::Part, export only final leaf shape objects.
+ONLY_LEAF_SHAPES = True
+
+# Set True to exclude sketch/wire/shell-only objects.
+ONLY_OBJECTS_WITH_SOLIDS = False
+
+# Important:
+# True = use Part_TransformedCopy temporarily so each exported shape is global-frame.
+# This is slower, but safest for App::Part/local coordinate issues.
+USE_TEMP_TRANSFORMED_COPY_FOR_GLOBAL_FRAME = True
+
+BREP_EXTENSION = ".brep"
+MANIFEST_NAME = "_brep_export_manifest.csv"
+LOG_NAME = "_brep_export_log.txt"
+
+RECOMPUTE_BEFORE_EXPORT = True
+CLEAR_SELECTION_AFTER = False
+
+SKIP_EXPORT_PREFIXES = [
+    # "HIGHLIGHT_",
+    # "OWNER_",
+    # "BADFACE_",
+    # "PRE_",
+]
+
+# ============================================================
+
+
+def msg(lines, text=""):
+    s = str(text)
+    lines.append(s)
+    App.Console.PrintMessage(s + "\\n")
+
+
+def is_app_part(obj):
+    return getattr(obj, "TypeId", "") == "App::Part"
+
+
+def has_shape(obj):
+    if not hasattr(obj, "Shape"):
+        return False
+    try:
+        sh = obj.Shape
+        return sh is not None and not sh.isNull()
+    except Exception:
+        return False
+
+
+def shape_type(obj):
+    try:
+        return str(obj.Shape.ShapeType)
+    except Exception:
+        return "UNKNOWN"
+
+
+def solid_count(obj):
+    try:
+        return len(obj.Shape.Solids)
+    except Exception:
+        return 0
+
+
+def children_of(obj):
+    out = []
+
+    if hasattr(obj, "Group"):
+        try:
+            out.extend(list(obj.Group))
+        except Exception:
+            pass
+
+    try:
+        for c in obj.OutList:
+            if c not in out:
+                out.append(c)
+    except Exception:
+        pass
+
+    return out
+
+
+def has_app_part_descendant(obj):
+    try:
+        for c in obj.OutListRecursive:
+            if c is not obj and is_app_part(c):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def has_shaped_descendant(obj):
+    try:
+        for c in obj.OutListRecursive:
+            if c is not obj and has_shape(c):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def should_skip_by_prefix(obj):
+    for p in SKIP_EXPORT_PREFIXES:
+        if str(obj.Name).startswith(p) or str(obj.Label).startswith(p):
+            return True
+    return False
+
+
+def collect_app_parts(root, out, seen):
+    if root.Name in seen:
+        return
+
+    seen.add(root.Name)
+
+    if is_app_part(root):
+        out.append(root)
+
+    if PROCESS_SELECTION_DESCENDANT_PARTS:
+        for c in children_of(root):
+            collect_app_parts(c, out, seen)
+
+
+def collect_shape_targets(obj, out, seen):
+    if obj.Name in seen:
+        return
+
+    seen.add(obj.Name)
+
+    for c in children_of(obj):
+        collect_shape_targets(c, out, seen)
+
+    if not has_shape(obj):
+        return
+
+    if should_skip_by_prefix(obj):
+        return
+
+    if ONLY_LEAF_SHAPES and has_shaped_descendant(obj):
+        return
+
+    if ONLY_OBJECTS_WITH_SOLIDS and solid_count(obj) < 1:
+        return
+
+    out.append(obj)
+
+
+def get_shape_targets_for_part(part_obj):
+    targets = []
+    seen = set()
+
+    for c in children_of(part_obj):
+        collect_shape_targets(c, targets, seen)
+
+    dedup = []
+    seen_names = set()
+
+    for obj in targets:
+        if obj.Name not in seen_names:
+            dedup.append(obj)
+            seen_names.add(obj.Name)
+
+    return dedup
+
+
+def sanitize_filename(s):
+    s = str(s).strip()
+    s = re.sub(r"[\\\\/:*?\\\"<>|]+", "_", s)
+    s = re.sub(r"\\s+", "_", s)
+    s = re.sub(r"_+", "_", s)
+    s = s.strip("._ ")
+
+    if not s:
+        s = "unnamed"
+
+    return s[:180]
+
+
+def unique_path(folder, base, ext):
+    path = os.path.join(folder, base + ext)
+
+    if not os.path.exists(path):
+        return path
+
+    i = 1
+    while True:
+        path = os.path.join(folder, base + "_" + str(i).zfill(4) + ext)
+        if not os.path.exists(path):
+            return path
+        i += 1
+
+
+def choose_folder():
+    folder = QtWidgets.QFileDialog.getExistingDirectory(
+        None,
+        "Choose folder for per-App::Part BREP export",
+        os.path.expanduser("~"),
+    )
+
+    if not folder:
+        raise RuntimeError("No export folder selected.")
+
+    return folder
+
+
+def show_scrollable_message(title, text):
+    dialog = QtWidgets.QDialog()
+    dialog.setWindowTitle(title)
+    dialog.resize(1000, 750)
+
+    layout = QtWidgets.QVBoxLayout(dialog)
+
+    label = QtWidgets.QLabel("The following text was copied to the clipboard:")
+    layout.addWidget(label)
+
+    box = QtWidgets.QPlainTextEdit()
+    box.setPlainText(text)
+    box.setReadOnly(True)
+    layout.addWidget(box)
+
+    buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok)
+    buttons.accepted.connect(dialog.accept)
+    layout.addWidget(buttons)
+
+    dialog.exec_()
+
+
+def direct_global_shape_copy(obj):
+    sh = obj.Shape.copy()
+
+    try:
+        gp = obj.getGlobalPlacement()
+        sh.Placement = gp.multiply(sh.Placement)
+        return sh
+    except Exception:
+        pass
+
+    try:
+        sh.Placement = obj.Placement.multiply(sh.Placement)
+    except Exception:
+        pass
+
+    return sh
+
+
+def transformed_copy_shape(obj):
+    before = set(o.Name for o in doc.Objects)
+
+    Gui.Selection.clearSelection()
+    Gui.Selection.addSelection(doc.Name, obj.Name)
+
+    try:
+        Gui.runCommand("Part_TransformedCopy", 0)
+        doc.recompute()
+    except Exception as e:
+        raise RuntimeError("Part_TransformedCopy failed for " + obj.Name + ": " + repr(e))
+
+    after = [o for o in doc.Objects if o.Name not in before]
+    shaped_after = [o for o in after if has_shape(o)]
+
+    if not shaped_after:
+        # Clean up any non-shape helper objects created by the command.
+        for temp in reversed(after):
+            try:
+                doc.removeObject(temp.Name)
+            except Exception:
+                pass
+        raise RuntimeError("Part_TransformedCopy created no shaped object for " + obj.Name)
+
+    temp_obj = shaped_after[-1]
+
+    try:
+        sh = temp_obj.Shape.copy()
+    finally:
+        for temp in reversed(after):
+            try:
+                doc.removeObject(temp.Name)
+            except Exception:
+                pass
+
+    return sh
+
+
+def export_app_part_to_brep(part_obj, folder):
+    shape_targets = get_shape_targets_for_part(part_obj)
+
+    if not shape_targets:
+        raise RuntimeError("No shaped child objects found under App::Part " + part_obj.Label)
+
+    shapes = []
+
+    for obj in shape_targets:
+        if USE_TEMP_TRANSFORMED_COPY_FOR_GLOBAL_FRAME:
+            sh = transformed_copy_shape(obj)
+        else:
+            sh = direct_global_shape_copy(obj)
+
+        shapes.append(sh)
+
+    if not shapes:
+        raise RuntimeError("No shapes collected under App::Part " + part_obj.Label)
+
+    if len(shapes) == 1:
+        export_shape = shapes[0]
+    else:
+        export_shape = Part.makeCompound(shapes)
+
+    file_base = sanitize_filename(part_obj.Label)
+    path = unique_path(folder, file_base, BREP_EXTENSION)
+
+    export_shape.exportBrep(path)
+
+    total_solids = 0
+    for obj in shape_targets:
+        total_solids += solid_count(obj)
+
+    return path, shape_targets, total_solids
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+doc = App.ActiveDocument
+
+if doc is None:
+    raise RuntimeError("No active document.")
+
+folder = choose_folder()
+
+if RECOMPUTE_BEFORE_EXPORT:
+    doc.recompute()
+
+try:
+    Gui.ActiveDocument.resetEdit()
+except Exception:
+    pass
+
+try:
+    Gui.ActiveDocument.ActiveView.setActiveObject("part", None)
+except Exception:
+    pass
+
+roots = Gui.Selection.getSelection()
+
+parts = []
+
+if PROCESS_SELECTION_IF_ANY and roots:
+    seen_parts = set()
+
+    for root in roots:
+        collect_app_parts(root, parts, seen_parts)
+else:
+    parts = [obj for obj in doc.Objects if is_app_part(obj)]
+
+# Deduplicate while preserving order.
+dedup_parts = []
+seen_part_names = set()
+
+for part_obj in parts:
+    if part_obj.Name not in seen_part_names:
+        dedup_parts.append(part_obj)
+        seen_part_names.add(part_obj.Name)
+
+parts = dedup_parts
+
+if ONLY_LEAF_APP_PARTS:
+    parts = [p for p in parts if not has_app_part_descendant(p)]
+
+# Skip empty App::Parts.
+export_parts = []
+empty_parts = []
+
+for p in parts:
+    targets = get_shape_targets_for_part(p)
+    if targets:
+        export_parts.append(p)
+    else:
+        empty_parts.append(p)
+
+if not export_parts:
+    raise RuntimeError("No App::Part objects with shaped descendants found to export.")
+
+timestamp = datetime.now().isoformat(timespec="seconds")
+
+lines = []
+rows = []
+
+msg(lines, "Per-App::Part BREP export")
+msg(lines, "Generated at: " + timestamp)
+msg(lines, "Document: " + doc.Name)
+msg(lines, "Export folder: " + folder)
+msg(lines, "App::Parts to export: " + str(len(export_parts)))
+msg(lines, "")
+
+msg(lines, "Options:")
+msg(lines, "  PROCESS_SELECTION_IF_ANY: " + str(PROCESS_SELECTION_IF_ANY))
+msg(lines, "  PROCESS_SELECTION_DESCENDANT_PARTS: " + str(PROCESS_SELECTION_DESCENDANT_PARTS))
+msg(lines, "  ONLY_LEAF_APP_PARTS: " + str(ONLY_LEAF_APP_PARTS))
+msg(lines, "  ONLY_LEAF_SHAPES: " + str(ONLY_LEAF_SHAPES))
+msg(lines, "  ONLY_OBJECTS_WITH_SOLIDS: " + str(ONLY_OBJECTS_WITH_SOLIDS))
+msg(lines, "  USE_TEMP_TRANSFORMED_COPY_FOR_GLOBAL_FRAME: " + str(USE_TEMP_TRANSFORMED_COPY_FOR_GLOBAL_FRAME))
+msg(lines, "")
+
+if empty_parts:
+    msg(lines, "Skipped empty App::Parts:")
+    for p in empty_parts:
+        msg(lines, "  - " + p.Name + " | " + p.Label)
+    msg(lines, "")
+
+exported = []
+failed = []
+
+for index, part_obj in enumerate(export_parts, start=1):
+    App.Console.PrintMessage(
+        "Exporting "
+        + str(index)
+        + " / "
+        + str(len(export_parts))
+        + ": "
+        + part_obj.Label
+        + "\\n"
+    )
+
+    try:
+        QtWidgets.QApplication.processEvents()
+    except Exception:
+        pass
+
+    status = "OK"
+    error = ""
+    path = ""
+    shape_targets = []
+    total_solids = 0
+
+    try:
+        path, shape_targets, total_solids = export_app_part_to_brep(part_obj, folder)
+        exported.append(path)
+        msg(lines, "OK: " + part_obj.Name + " | " + part_obj.Label + " -> " + path)
+    except Exception as e:
+        status = "FAILED"
+        error = repr(e)
+        failed.append((part_obj, error))
+        msg(lines, "FAILED: " + part_obj.Name + " | " + part_obj.Label + " -> " + error)
+
+    rows.append({
+        "index": index,
+        "status": status,
+        "app_part_name": part_obj.Name,
+        "app_part_label": part_obj.Label,
+        "type_id": part_obj.TypeId,
+        "exported_leaf_shapes": len(shape_targets),
+        "exported_solids": total_solids,
+        "brep_path": path,
+        "error": error,
+    })
+
+manifest_path = os.path.join(folder, MANIFEST_NAME)
+log_path = os.path.join(folder, LOG_NAME)
+
+with open(manifest_path, "w", newline="") as f:
+    writer = csv.DictWriter(
+        f,
+        fieldnames=[
+            "index",
+            "status",
+            "app_part_name",
+            "app_part_label",
+            "type_id",
+            "exported_leaf_shapes",
+            "exported_solids",
+            "brep_path",
+            "error",
+        ],
+    )
+    writer.writeheader()
+
+    for row in rows:
+        writer.writerow(row)
+
+msg(lines, "")
+msg(lines, "============================================================")
+msg(lines, "SUMMARY")
+msg(lines, "============================================================")
+msg(lines, "App::Parts targeted: " + str(len(export_parts)))
+msg(lines, "Exported:            " + str(len(exported)))
+msg(lines, "Failed:              " + str(len(failed)))
+msg(lines, "Manifest:            " + manifest_path)
+msg(lines, "Log:                 " + log_path)
+
+if failed:
+    msg(lines, "")
+    msg(lines, "FAILED APP::PARTS:")
+    for part_obj, error in failed:
+        msg(lines, "  - " + part_obj.Name + " | " + part_obj.Label + " | " + error)
+
+text = "\\n".join(lines)
+
+with open(log_path, "w") as f:
+    f.write(text + "\\n")
+
+try:
+    QtWidgets.QApplication.clipboard().setText(text)
+except Exception:
+    pass
+
+if CLEAR_SELECTION_AFTER:
+    Gui.Selection.clearSelection()
+
+try:
+    show_scrollable_message("Per-App::Part BREP export complete", text)
+except Exception:
+    pass
+
+print("")
+print("Export folder:", folder)
+print("Manifest:", manifest_path)
+print("Log:", log_path)
