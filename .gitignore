@@ -15,6 +15,7 @@ sim_results/
 !.gitignore
 !.gitattributes
 !.github/
+!.envrc
 # Ignore common local artifacts
 .DS_Store
 *.swp
@@ -39,5 +40,18 @@ geometry/createGeometryFromCAD/manual_overwrites
 __pycache__
 */__pycache__
 */*/__pycache__
+.direnv/
+# To Be removed
 *audit*
-
+result
+geometry/3d_brep_files/
+geometry/3d_stl_files/
+geometry/3d_wrapped_files/
+geometry/3d_wrapped_simplified/
+geometry/3d_products/
+geometry/alpha_wrap_out_tests/
+geometry/CGAL_Mesh3Tests
+geometry/stl_shell_partition_tests
+geometry/CGAL_AlphaWrapTests
+# commited but to be deleted
+geometry/createGeometryFromCAD
