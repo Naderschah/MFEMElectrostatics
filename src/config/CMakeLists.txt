@@ -2,6 +2,8 @@
 add_library(config STATIC
     Config.cpp
     Config.h
+    ConfigDocument.cpp
+    ConfigDocument.h
 )
 
 find_package(yaml-cpp REQUIRED)

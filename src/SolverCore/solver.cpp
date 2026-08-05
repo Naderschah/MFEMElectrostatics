@@ -234,7 +234,15 @@ std::unique_ptr<mfem::ParGridFunction> SolvePoisson(ParFiniteElementSpace &pfes,
     std::ofstream it_log(log_path);
     ResidualFileMonitor monitor(it_log);
     cg.SetMonitor(monitor);
-    cg.Mult(B, X);;
+    std::chrono::steady_clock::time_point t_start;
+    if (cfg->debug.timing) t_start = std::chrono::steady_clock::now();
+    cg.Mult(B, X);
+    if (cfg->debug.timing)
+    {
+        auto t_end = std::chrono::steady_clock::now();
+        auto dt = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+        std::cout << "[Timing]: CG + AMG Solve (" << dt << " ms)" << std::endl;
+    }
   }
   else
   {

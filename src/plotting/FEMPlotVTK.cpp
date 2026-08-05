@@ -20,6 +20,7 @@
 
 // Mappers and Actors
 #include <vtkActor.h>
+#include <vtkAppendFilter.h>
 #include <vtkDataSetMapper.h>
 #include <vtkPolyDataMapper.h>
 #include <vtkAppendPolyData.h>
@@ -71,6 +72,7 @@
 #include <vtkProperty.h>
 #include <vtkRenderWindow.h>
 #include <vtkOpenGLRenderWindow.h> 
+#include <vtkEGLRenderWindow.h>
 #include <vtkRenderer.h>
 #include <vtkRungeKutta4.h>
 #include <vtkScalarBarActor.h>
@@ -81,6 +83,7 @@
 #include <vtkUnstructuredGrid.h>
 #include <vtkWindowToImageFilter.h>
 #include <vtkXMLUnstructuredGridReader.h>
+#include <vtkXMLPUnstructuredGridReader.h>
 
 #include <vtkStaticCellLocator.h>
 #include <vtkGenericCell.h>
@@ -90,6 +93,32 @@
 
 namespace FEMPlot
 {
+
+namespace
+{
+static vtkSmartPointer<vtkRenderWindow> CreateOffscreenRenderWindow()
+{
+    const char* display = std::getenv("DISPLAY");
+    const char* wayland = std::getenv("WAYLAND_DISPLAY");
+    const bool headless = ((!display || !*display) && (!wayland || !*wayland));
+
+    vtkSmartPointer<vtkRenderWindow> rw;
+    if (headless)
+    {
+        auto egl = vtkSmartPointer<vtkEGLRenderWindow>::New();
+        rw = egl;
+    }
+    else
+    {
+        rw = vtkSmartPointer<vtkRenderWindow>::New();
+    }
+
+    rw->SetOffScreenRendering(1);
+    rw->SetAlphaBitPlanes(0);
+    rw->SetMultiSamples(0);
+    return rw;
+}
+} // namespace
 
 // -----------------------------------------------------------------------------
 // Plot config loading (simple INI-style)
@@ -475,23 +504,155 @@ bool LoadPlotConfig(const std::string& path, PlotConfig& cfg)
 // Core IO
 // -----------------------------------------------------------------------------
 
+static std::string ResolveDatasetPathFromPVD(const std::string& pvd_path)
+{
+    std::ifstream in(pvd_path);
+    if (!in)
+    {
+        return {};
+    }
+
+    const std::string xml((std::istreambuf_iterator<char>(in)),
+                          std::istreambuf_iterator<char>());
+    const std::string key = "file=\"";
+    const std::size_t pos = xml.find(key);
+    if (pos == std::string::npos)
+    {
+        return {};
+    }
+
+    const std::size_t begin = pos + key.size();
+    const std::size_t end = xml.find('"', begin);
+    if (end == std::string::npos || end <= begin)
+    {
+        return {};
+    }
+
+    const std::string ref = xml.substr(begin, end - begin);
+    std::filesystem::path ref_path(ref);
+    if (ref_path.is_absolute())
+    {
+        return ref_path.string();
+    }
+    return (std::filesystem::path(pvd_path).parent_path() / ref_path).string();
+}
+
+static std::vector<std::string> ResolvePiecePathsFromPVTU(const std::string& pvtu_path)
+{
+    std::ifstream in(pvtu_path);
+    if (!in)
+    {
+        return {};
+    }
+
+    const std::string xml((std::istreambuf_iterator<char>(in)),
+                          std::istreambuf_iterator<char>());
+    const std::string key = "Source=\"";
+
+    std::vector<std::string> pieces;
+    std::size_t pos = 0;
+    while (true)
+    {
+        pos = xml.find(key, pos);
+        if (pos == std::string::npos) break;
+        const std::size_t begin = pos + key.size();
+        const std::size_t end = xml.find('"', begin);
+        if (end == std::string::npos || end <= begin) break;
+
+        const std::string ref = xml.substr(begin, end - begin);
+        std::filesystem::path ref_path(ref);
+        if (ref_path.is_absolute())
+        {
+            pieces.push_back(ref_path.string());
+        }
+        else
+        {
+            pieces.push_back((std::filesystem::path(pvtu_path).parent_path() / ref_path).string());
+        }
+        pos = end + 1;
+    }
+    return pieces;
+}
+
 vtkSmartPointer<vtkUnstructuredGrid>
 LoadGridFromVTU(const std::string& filename)
 {
-    auto reader = vtkSmartPointer<vtkXMLUnstructuredGridReader>::New();
-    reader->SetFileName(filename.c_str());
-    reader->Update();
+    auto ends_with = [](const std::string& s, const std::string& suf) {
+        return s.size() >= suf.size() &&
+               s.compare(s.size() - suf.size(), suf.size(), suf) == 0;
+    };
 
-    vtkUnstructuredGrid* ug = reader->GetOutput();
-    if (!ug)
+    vtkSmartPointer<vtkUnstructuredGrid> result = vtkSmartPointer<vtkUnstructuredGrid>::New();
+    bool loaded = false;
+
+    if (ends_with(filename, ".pvtu"))
     {
-        std::cerr << "[LoadGridFromVTU] ERROR: reader->GetOutput() is null for '"
+        // Prefer manual merge of piece VTUs; this avoids runtime crashes in
+        // some headless VTK builds when using vtkXMLPUnstructuredGridReader.
+        const auto pieces = ResolvePiecePathsFromPVTU(filename);
+        if (!pieces.empty())
+        {
+            auto append = vtkSmartPointer<vtkAppendFilter>::New();
+            append->MergePointsOn();
+
+            int loaded_pieces = 0;
+            for (const auto& piece_path : pieces)
+            {
+                auto reader = vtkSmartPointer<vtkXMLUnstructuredGridReader>::New();
+                reader->SetFileName(piece_path.c_str());
+                reader->Update();
+
+                vtkUnstructuredGrid* part = reader->GetOutput();
+                if (!part) continue;
+                if (part->GetNumberOfPoints() == 0 && part->GetNumberOfCells() == 0) continue;
+
+                auto part_copy = vtkSmartPointer<vtkUnstructuredGrid>::New();
+                part_copy->ShallowCopy(part);
+                append->AddInputData(part_copy);
+                ++loaded_pieces;
+            }
+
+            if (loaded_pieces > 0)
+            {
+                append->Update();
+                if (auto* merged = vtkUnstructuredGrid::SafeDownCast(append->GetOutput()))
+                {
+                    result->ShallowCopy(merged);
+                    loaded = true;
+                }
+            }
+        }
+
+        if (!loaded)
+        {
+            auto reader = vtkSmartPointer<vtkXMLPUnstructuredGridReader>::New();
+            reader->SetFileName(filename.c_str());
+            reader->Update();
+            if (auto* ug = reader->GetOutput())
+            {
+                result->ShallowCopy(ug);
+                loaded = true;
+            }
+        }
+    }
+    else
+    {
+        auto reader = vtkSmartPointer<vtkXMLUnstructuredGridReader>::New();
+        reader->SetFileName(filename.c_str());
+        reader->Update();
+        if (auto* ug = reader->GetOutput())
+        {
+            result->ShallowCopy(ug);
+            loaded = true;
+        }
+    }
+
+    if (!loaded || result->GetNumberOfPoints() == 0)
+    {
+        std::cerr << "[LoadGridFromVTU] ERROR: reader output is null for '"
                   << filename << "'.\n";
         return nullptr;
     }
-
-    auto result = vtkSmartPointer<vtkUnstructuredGrid>::New();
-    result->ShallowCopy(ug);
     return result;
 }
 
@@ -814,7 +975,7 @@ void AddStreamlines(vtkDataSet* dataset,
 // -----------------------------------------------------------------------------
 
 // Render an already-configured render window.
-static void RenderOffscreenPNG(vtkOpenGLRenderWindow* renderWindow,
+static void RenderOffscreenPNG(vtkRenderWindow* renderWindow,
                                const std::string& filename)
 {
     if (!renderWindow)
@@ -827,31 +988,30 @@ static void RenderOffscreenPNG(vtkOpenGLRenderWindow* renderWindow,
         ogl->SetUseOffScreenBuffers(true);
     }
 
-
-    renderWindow->DoubleBufferOff();
-    renderWindow->SwapBuffersOff();
+    // In headless EGL/OSMesa paths, reading the front buffer often yields
+    // black frames. Render and read from the back buffer instead.
     renderWindow->Render();
 
     vtkNew<vtkWindowToImageFilter> windowToImageFilter;
     windowToImageFilter->SetInput(renderWindow);
-    windowToImageFilter->SetInputBufferTypeToRGB();
-    windowToImageFilter->ReadFrontBufferOn();
-    windowToImageFilter->ShouldRerenderOff();
+    windowToImageFilter->SetInputBufferTypeToRGBA();
+    windowToImageFilter->ReadFrontBufferOff();
+    windowToImageFilter->ShouldRerenderOn();
     windowToImageFilter->Update();
 
     vtkImageData* image = windowToImageFilter->GetOutput();
-    int* dims = image->GetDimensions();
-    auto* p = static_cast<unsigned char*>(image->GetScalarPointer(0,0,0));
-    std::cerr << "dims=" << dims[0] << "x" << dims[1]
-            << " comps=" << image->GetNumberOfScalarComponents()
-            << " first_pixel=" << int(p[0]) << "," << int(p[1]) << "," << int(p[2]) << "\n";
-
     if (!image || !image->GetScalarPointer())
     {
         std::cerr << "RenderOffscreenPNG(window) ERROR: "
                      "WindowToImageFilter produced null image\n";
         return;
     }
+
+    int* dims = image->GetDimensions();
+    auto* p = static_cast<unsigned char*>(image->GetScalarPointer(0,0,0));
+    std::cerr << "dims=" << dims[0] << "x" << dims[1]
+            << " comps=" << image->GetNumberOfScalarComponents()
+            << " first_pixel=" << int(p[0]) << "," << int(p[1]) << "," << int(p[2]) << "\n";
 
     vtkNew<vtkPNGWriter> writer;
     writer->SetFileName(filename.c_str());
@@ -878,8 +1038,7 @@ void RenderOffscreenPNG(vtkRenderer* renderer,
         renderer->GetRenderWindow()->RemoveRenderer(renderer);
     }
 
-    vtkNew<vtkOpenGLRenderWindow> renderWindow;
-    renderWindow->SetOffScreenRendering(1);
+    auto renderWindow = CreateOffscreenRenderWindow();
     renderWindow->SetSize(width, height);
     renderWindow->AddRenderer(renderer);
 
@@ -1787,10 +1946,7 @@ void PlotScalarFieldView(vtkUnstructuredGrid* grid,
     int img_w = (request.image_width  > 0) ? request.image_width  : plotting.image_width;
     int img_h = (request.image_height > 0) ? request.image_height : plotting.image_height;
 
-    vtkNew<vtkOpenGLRenderWindow> renderWindow;
-    renderWindow->SetOffScreenRendering(1);
-    renderWindow->SetAlphaBitPlanes(0);
-    renderWindow->SetMultiSamples(0);
+    auto renderWindow = CreateOffscreenRenderWindow();
     renderWindow->SetSize(img_w, img_h);
     renderWindow->SetNumberOfLayers(2);
 
@@ -2562,7 +2718,20 @@ PlotInput PreparePlotInput(const char* raw_path)
     if (ends_with(path, ".pvd"))
     {
         R.base_dir = dirname_of(path);
-        R.vtu_file = R.base_dir + "/Cycle000000/proc000000.vtu";
+        R.vtu_file = ResolveDatasetPathFromPVD(path);
+        if (R.vtu_file.empty())
+        {
+            // Backward-compatible fallback
+            const std::string pvtu_guess = R.base_dir + "/Cycle000000/data.pvtu";
+            if (std::filesystem::exists(pvtu_guess))
+            {
+                R.vtu_file = pvtu_guess;
+            }
+            else
+            {
+                R.vtu_file = R.base_dir + "/Cycle000000/proc000000.vtu";
+            }
+        }
     }
     else
     {
@@ -2570,7 +2739,7 @@ PlotInput PreparePlotInput(const char* raw_path)
         R.base_dir = dirname_of(path);
     }
 
-    std::cout << "[PreparePlotInput] Reading VTU: " << R.vtu_file << "\n";
+    std::cout << "[PreparePlotInput] Reading mesh data: " << R.vtu_file << "\n";
 
     R.grid = LoadGridFromVTU(R.vtu_file);
     if (!R.grid)
@@ -2582,15 +2751,13 @@ PlotInput PreparePlotInput(const char* raw_path)
 
     R.out_dir = R.base_dir + "/plots";
 
+    std::error_code ec;
+    std::filesystem::create_directories(R.out_dir, ec);
+    if (ec)
     {
-        std::string cmd = "mkdir -p \"" + R.out_dir + "\"";
-        int ret = std::system(cmd.c_str());
-        if (ret != 0)
-        {
-            std::cerr << "[PreparePlotInput] ERROR: Failed to create output directory: "
-                      << R.out_dir << "\n";
-            std::exit(1);
-        }
+        std::cerr << "[PreparePlotInput] ERROR: Failed to create output directory: "
+                  << R.out_dir << " (" << ec.message() << ")\n";
+        std::exit(1);
     }
 
     return R;
@@ -2723,20 +2890,26 @@ static int write_test_png_egl(const std::filesystem::path& out_png, bool debug)
 }
 
 // Entrypoint
-int _make_plots(std::filesystem::path /*pvd*/, bool debug)
+int _make_plots(std::filesystem::path pvd, bool debug)
 {
-  const std::filesystem::path out =
-      "/work/sim_results/run_0001/Simulation/plots/test.png";
+  const char* display = std::getenv("DISPLAY");
+  const char* wayland = std::getenv("WAYLAND_DISPLAY");
+  const bool headless = ((!display || !*display) && (!wayland || !*wayland));
 
-  // Adjust if you know the correct device index; start with 0.
-  force_egl(/*deviceIndex=*/0, /*verbose=*/debug);
-
-  int rc = write_test_png_egl(out, debug);
-  if (rc == 0) {
-    std::cerr << "[VTK] wrote " << out << "\n";
-  } else {
-    std::cerr << "[VTK] failed to write " << out << "\n";
+  if (headless)
+  {
+    // Headless default: prefer EGL over OSMesa. This avoids crashes when
+    // VTK tries OSMesa but libOSMesa is not installed.
+    setenv("VTK_DEFAULT_OPENGL_WINDOW", "vtkEGLRenderWindow", 1);
+    if (!std::getenv("VTK_DEFAULT_EGL_DEVICE_INDEX"))
+    {
+      setenv("VTK_DEFAULT_EGL_DEVICE_INDEX", "0", 0);
+    }
+    if (debug)
+    {
+      std::cerr << "[VTK] headless mode detected; forcing EGL render window backend\n";
+    }
   }
-  return rc;
-}
 
+  return __make_plots(pvd, debug);
+}

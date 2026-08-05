@@ -15,6 +15,9 @@ struct SimulationResult
 {
     bool success = false;
     std::string error_message;
+    bool adaptive_converged = true;
+    bool adaptive_iteration_limit_reached = false;
+    int adaptive_iterations = 0;
 
     std::unique_ptr<mfem::ParMesh>                 mesh;
     std::unique_ptr<mfem::FiniteElementCollection> fec;

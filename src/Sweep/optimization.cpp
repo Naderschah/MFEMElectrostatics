@@ -2,7 +2,7 @@
 
 // ===================================== Main Loop ==================================== 
 
-void run_optimization(const Config &init_cfg, std::string config_str)
+void run_optimization(const Config &init_cfg, const ConfigDocument &base_doc)
 {
     MPI_Comm comm = MPI_COMM_WORLD;
     int rank = 0, world_size = 1;
@@ -88,7 +88,7 @@ void run_optimization(const Config &init_cfg, std::string config_str)
             MPI_Bcast(x.data(), nvars, MPI_DOUBLE, 0, comm);
 
             (void)evaluate_one_optimization_point(
-                config_str,
+                base_doc,
                 opt,
                 x,
                 static_cast<std::size_t>(eval_index_u64),
@@ -125,7 +125,7 @@ void run_optimization(const Config &init_cfg, std::string config_str)
             MPI_Bcast(const_cast<double*>(x.data()), nvars, MPI_DOUBLE, 0, comm);
 
             double f = evaluate_one_optimization_point(
-                config_str,
+                base_doc,
                 opt,
                 x,
                 eval_counter,
@@ -243,7 +243,7 @@ RunAndMetricsResult run_simulation_and_save(YAML::Node yaml_config, std::size_t 
 
 // ================================ Optimization Targets ==============================
 
-double evaluate_one_optimization_point(const std::string &config_str,
+double evaluate_one_optimization_point(const ConfigDocument &base_doc,
                                        const OptimizationSettings &opt,
                                        const std::vector<double> &x,
                                        std::size_t eval_index,
@@ -253,7 +253,7 @@ double evaluate_one_optimization_point(const std::string &config_str,
 {
     std::cout << "[OPTIMIZATION] Running iteration " << eval_index << std::endl;
     // 1. Build config for this eval
-    auto root = YAML::Load(config_str);
+    YAML::Node root = base_doc.Root();
 
     // apply optimization variables
     apply_opt_vars(root, opt, x);

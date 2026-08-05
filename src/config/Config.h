@@ -12,7 +12,7 @@
 struct Boundary {
     int bdr_id = -1;        // bdr_id
     std::string type;       // "dirichlet" | "neumann" | "neumann_internal" | "robin"
-    double value = 0.0;
+    double value = std::numeric_limits<double>::quiet_NaN();
     // Used for depth dependent neumann only so far
     bool depth_dependent = false;
     double z_bot = 0.0;
@@ -23,7 +23,7 @@ struct Boundary {
 
 struct Material {
     int id = -1;            // attr_id
-    double epsilon_r = 1.0;
+    double epsilon_r = std::numeric_limits<double>::quiet_NaN();
 };
 struct TMOPSettings {
     bool enable = false;
@@ -158,6 +158,14 @@ struct DebugSettings
 
     // Dump data to file where applicable
     bool dumpdata              = false;
+};
+
+// Voltage assignment / resistor-chain behavior
+struct VoltageSettings
+{
+    // If true, fail when a resistor-network connected component has no fixed node.
+    // This catches floating electrodes after field-cage solve.
+    bool error_on_floating_after_resistor_chain = true;
 };
 
 // -------------------- Circuit Computation --------------------------
@@ -361,6 +369,7 @@ struct Config {
     MeshSettings mesh;
     ComputeSettings compute;
     DebugSettings  debug;
+    VoltageSettings voltage;
     SolverSettings solver;
 
     std::unordered_map<std::string, Boundary> boundaries;

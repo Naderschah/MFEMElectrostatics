@@ -7,7 +7,7 @@ cmake_minimum_required(VERSION 3.15)
 set(IS_SOLVERCORE_TOPLEVEL OFF)
 if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(IS_SOLVERCORE_TOPLEVEL ON)
-    project(SolverCoreProj LANGUAGES CXX)
+    project(SolverCoreProj LANGUAGES C CXX)
 
     set(CMAKE_CXX_STANDARD 17)
     set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -17,10 +17,17 @@ endif()
 # --- Third-party packages (needed in any mode) -----------
 # ---------------------------------------------------------
 find_package(yaml-cpp REQUIRED)
-find_package(MPI REQUIRED)
+find_package(MPI REQUIRED COMPONENTS C CXX)
 find_package(OpenMP REQUIRED)
 
-set(MFEM_DIR "/home/felix/mfem-install/lib/cmake/mfem")
+if (NOT DEFINED MFEM_DIR)
+    if (DEFINED ENV{MFEM_DIR} AND EXISTS "$ENV{MFEM_DIR}")
+        set(MFEM_DIR "$ENV{MFEM_DIR}" CACHE PATH "Path to MFEMConfig.cmake")
+    elseif (EXISTS "/home/felix/mfem-install/lib/cmake/mfem")
+        set(MFEM_DIR "/home/felix/mfem-install/lib/cmake/mfem" CACHE PATH "Path to MFEMConfig.cmake")
+    endif()
+endif()
+
 find_package(MFEM CONFIG REQUIRED)
 
 # ---------------------------------------------------------

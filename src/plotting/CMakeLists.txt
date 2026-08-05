@@ -11,7 +11,13 @@ if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 endif()
 
 # Path to vtk-config.cmake / VTKConfig.cmake
-set(VTK_DIR "$ENV{HOME}/vtk/install/lib/cmake/vtk-9.5" CACHE PATH "Path to VTK config")
+if (NOT DEFINED VTK_DIR)
+    if (DEFINED ENV{VTK_DIR} AND EXISTS "$ENV{VTK_DIR}")
+        set(VTK_DIR "$ENV{VTK_DIR}" CACHE PATH "Path to VTK config")
+    elseif (EXISTS "$ENV{HOME}/vtk/install/lib/cmake/vtk-9.5")
+        set(VTK_DIR "$ENV{HOME}/vtk/install/lib/cmake/vtk-9.5" CACHE PATH "Path to VTK config")
+    endif()
+endif()
 
 find_package(VTK REQUIRED COMPONENTS
     CommonCore

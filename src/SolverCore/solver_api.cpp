@@ -15,12 +15,60 @@
 #include <sstream>
 #include <iomanip>
 #include <stdexcept>
+#include <optional>
 #include <omp.h>
 #include <filesystem>
 #include <chrono>
+#include <vector>
 
 
 using namespace mfem;
+
+namespace
+{
+void SyncResolvedConfigToYaml(const Config &cfg, YAML::Node &yaml_root)
+{
+    if (!yaml_root["boundaries"] || !yaml_root["boundaries"].IsMap())
+    {
+        yaml_root["boundaries"] = YAML::Node(YAML::NodeType::Map);
+    }
+    YAML::Node boundaries = yaml_root["boundaries"];
+
+    for (const auto &[name, boundary] : cfg.boundaries)
+    {
+        if (!boundaries[name] || !boundaries[name].IsMap())
+        {
+            boundaries[name] = YAML::Node(YAML::NodeType::Map);
+        }
+
+        YAML::Node dst = boundaries[name];
+        dst["bdr_id"] = boundary.bdr_id;
+        dst["type"] = boundary.type;
+        if (std::isfinite(boundary.value))
+        {
+            dst["value"] = boundary.value;
+        }
+        dst["depth_dependent"] = boundary.depth_dependent;
+        if (boundary.depth_dependent)
+        {
+            dst["z_bot"] = boundary.z_bot;
+            dst["z_top"] = boundary.z_top;
+            dst["value_bot"] = boundary.value_bot;
+            dst["value_top"] = boundary.value_top;
+        }
+    }
+
+    if (!cfg.mesh.path.empty())
+    {
+        if (!yaml_root["mesh"] || !yaml_root["mesh"].IsMap())
+        {
+            yaml_root["mesh"] = YAML::Node(YAML::NodeType::Map);
+        }
+        yaml_root["mesh"]["path"] = cfg.mesh.path;
+    }
+}
+
+} // namespace
 
 std::string PrecomputeAMRMesh(const Config &cfg,
                               int precision)
@@ -43,6 +91,18 @@ std::string PrecomputeAMRMesh(const Config &cfg,
         std::cout << "[Timing]: AMR timing (" << dt << " ms)" << std::endl;
     }
 
+    if (rank == 0 && !res.adaptive_converged)
+    {
+        std::cout
+            << "\n[AMR WARNING] Precompute stopped before convergence.\n"
+            << "  adaptive_iterations=" << res.adaptive_iterations
+            << ", iteration_limit_hit="
+            << (res.adaptive_iteration_limit_reached ? "true" : "false") << "\n"
+            << "  mesh.AMR_TMOP_iter currently limits adaptive solve passes.\n"
+            << "  Increase mesh.AMR_TMOP_iter (and/or mesh.AMR.max_iter) if you want fully converged precompute.\n"
+            << "  Runtime will use the precomputed AMR mesh without additional AMR refinement.\n\n";
+    }
+
     SaveAMRMeshArtifacts(*res.mesh, mesh_dir, cfg.mesh.amr, precision);
 
     if (rank == 0)
@@ -63,6 +123,13 @@ SimulationResult run_simulation(std::shared_ptr<Config> cfg,
                                 const std::filesystem::path& model_path,
                                 bool skip_amr = false)
 {
+  if (model_path.empty())
+  {
+    throw std::runtime_error(
+      "run_simulation: empty mesh/model path. "
+      "Set mesh.path or resolve mesh generation before simulation.");
+  }
+
   // What will this default to if I do nothing with MPI
   MPI_Comm comm = MPI_COMM_WORLD;
 
@@ -86,6 +153,9 @@ SimulationResult run_simulation(std::shared_ptr<Config> cfg,
   std::unique_ptr<mfem::ParGridFunction> V;
 
   const int max_iter = cfg->mesh.AMR_TMOP_iter;
+  bool adaptive_converged = false;
+  int adaptive_iterations = 0;
+  bool changed_on_last_iteration = false;
   std::string solver_log_overwrite = 
     cfg->mesh.amr.enable ? (std::filesystem::path(cfg->save_path) / "amr_mesh").string() : "";
   for (int it = 0; it < max_iter; ++it)
@@ -105,7 +175,14 @@ SimulationResult run_simulation(std::shared_ptr<Config> cfg,
       tmop_changed = ApplyTMOPStep(*mesh, *cfg);
     }
 
-    if (!amr_changed && !tmop_changed) { break; }
+    changed_on_last_iteration = (amr_changed || tmop_changed);
+    adaptive_iterations = it + 1;
+
+    if (!changed_on_last_iteration)
+    {
+      adaptive_converged = true;
+      break;
+    }
 
     pfes->Update();
     V->Update();
@@ -137,6 +214,10 @@ SimulationResult run_simulation(std::shared_ptr<Config> cfg,
   result.pfes = std::move(pfes);
   result.fec  = std::move(fec);
   result.V    = std::move(V);
+  result.adaptive_converged = adaptive_converged;
+  result.adaptive_iteration_limit_reached =
+    (!adaptive_converged && (adaptive_iterations >= max_iter) && changed_on_last_iteration);
+  result.adaptive_iterations = adaptive_iterations;
   result.success = true;
 
   return result;
@@ -618,20 +699,27 @@ std::string run_one(const Config &cfg,
     int world_size = 0;
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
 
-    std::filesystem::path model_path = cfg.mesh.path;
-    const std::filesystem::path run_dir(cfg.save_path);
-    std::string run_name = run_dir.filename().string();
-
     // Dispatch
     apply_fieldcage_network(yaml_root);
     Config cfg_copy = Config::LoadFromNode(yaml_root);
+    if (cfg_copy.mesh.path.empty())
+    {
+        throw std::runtime_error(
+            "run_one: mesh.path is empty after YAML/config resolution. "
+            "Provide mesh.path or mesh generation metadata.");
+    }
+
+    std::filesystem::path model_path = cfg_copy.mesh.path;
+    const std::filesystem::path run_dir(cfg_copy.save_path);
+    std::string run_name = run_dir.filename().string();
+
     auto cfg_ptr = std::make_shared<Config>(cfg_copy);
     MPI_Barrier(MPI_COMM_WORLD);
-    if (!cfg.debug.dry_run)
+    if (!cfg_copy.debug.dry_run)
     {
-        if (cfg.debug.timing) t_start = std::chrono::steady_clock::now();
+        if (cfg_copy.debug.timing) t_start = std::chrono::steady_clock::now();
         SimulationResult result = run_simulation(cfg_ptr, model_path, skip_amr);
-        if (cfg.debug.timing)
+        if (cfg_copy.debug.timing)
         {
             auto t_end = std::chrono::steady_clock::now();
             auto dt = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
@@ -643,16 +731,17 @@ std::string run_one(const Config &cfg,
                       << ": " << result.error_message << "\n";
             return {}; 
         }
+        SyncResolvedConfigToYaml(*cfg_ptr, yaml_root);
         save_results(result, cfg_copy.save_path, yaml_root);
     }
 
-    if (cfg.debug.printBoundaryConditions){
+    if (cfg_copy.debug.printBoundaryConditions){
         std::cout << "[DEBUG] Boundary Condition values" << std::endl;
         for (const auto& [name, b] : cfg_copy.boundaries) {
             std::cout << name << ": " << b.value << '\n';
         }
     }
-    if (cfg.debug.timing)
+    if (cfg_copy.debug.timing)
     {
         auto t_end = std::chrono::steady_clock::now();
         auto dt = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();

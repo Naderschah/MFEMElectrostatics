@@ -21,6 +21,7 @@ No built in bounds or constraints -> We need to handle these manually
 #include "mfem.hpp"
 
 #include "solver_api.h"
+#include "ConfigDocument.h"
 #include "ComputeElectricField.h"
 #include "config_modification.h"
 #include "optimization.h"
@@ -62,11 +63,11 @@ class OptimizationLogger;
 
 using ObjectiveFn = std::function<double(const OptimizationMetrics&)>;
 
-void run_optimization(const Config &init_cfg, std::string config_str);
+void run_optimization(const Config &init_cfg, const ConfigDocument &base_doc);
 
 RunAndMetricsResult run_simulation_and_save(const Config &cfg, std::size_t eval_index);
 
-double evaluate_one_optimization_point(const std::string &config_str, const OptimizationSettings &opt, const std::vector<double> &x, std::size_t eval_index, const ObjectiveFn &objective_fn, std::vector<OptRunRecord> &records, OptimizationLogger *logger);
+double evaluate_one_optimization_point(const ConfigDocument &base_doc, const OptimizationSettings &opt, const std::vector<double> &x, std::size_t eval_index, const ObjectiveFn &objective_fn, std::vector<OptRunRecord> &records, OptimizationLogger *logger);
 
 ObjectiveFn make_objective_function(const OptimizationSettings &opt);
 

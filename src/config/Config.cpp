@@ -7,6 +7,8 @@
 #include <cstdlib>
 #include <cmath>
 #include <cctype>
+#include <cstdint>
+#include <unordered_set>
 #include <mpi.h>
 
 
@@ -628,15 +630,42 @@ static void parse_debug_settings(Config &cfg, const YAML::Node &root)
     cfg.debug = dbg;
 }
 
+static void parse_voltage_settings(Config &cfg, const YAML::Node &root)
+{
+    VoltageSettings voltage = cfg.voltage;
+
+    YAML::Node vn = root["voltage_config"];
+    if (!vn) { vn = root["voltage"]; } // compatibility alias
+    if (!vn) {
+        cfg.voltage = voltage;
+        return;
+    }
+
+    voltage.error_on_floating_after_resistor_chain =
+        vn["error_on_floating_after_resistor_chain"]
+            ? vn["error_on_floating_after_resistor_chain"].as<bool>(
+                  voltage.error_on_floating_after_resistor_chain)
+            : voltage.error_on_floating_after_resistor_chain;
+
+    cfg.voltage = voltage;
+}
+
 static void parse_mesh_params(Config &cfg, const YAML::Node &root)
 {
-  // --- Mesh path
-  if (!root["mesh"] || !root["mesh"]["path"]) {
-    throw std::runtime_error("Config error: missing mandatory field 'mesh.path'");
+  if (!root["mesh"]) {
+    throw std::runtime_error("Config error: missing mandatory field 'mesh'");
   }
   const YAML::Node mesh = root["mesh"];
-  cfg.mesh.path = root["mesh"]["path"].as<std::string>("");
-  if (cfg.mesh.path == "") Error("Mesh Path must be provided");
+  // mesh.path is optional to support geometry-driven/lazy mesh resolution.
+  // Keep strict validation if the key is present.
+  if (mesh["path"]) {
+    cfg.mesh.path = mesh["path"].as<std::string>("");
+    if (cfg.mesh.path.empty()) {
+      Error("mesh.path must be non-empty when provided");
+    }
+  } else {
+    cfg.mesh.path.clear();
+  }
   if (mesh["AMR_TMOP_iter"])
   {
     cfg.mesh.AMR_TMOP_iter = mesh["AMR_TMOP_iter"].as<int>(cfg.mesh.AMR_TMOP_iter);
@@ -717,15 +746,58 @@ static void parse_material_params(Config &cfg, const YAML::Node &root)
 
         Material m;
         m.id        = node["attr_id"]   ? node["attr_id"].as<int>(-1)   : -1;
-        m.epsilon_r = node["epsilon_r"] ? node["epsilon_r"].as<double>(1.0) : 1.0;
+        if (!node["epsilon_r"]) {
+            throw std::runtime_error(
+                "Material '" + name + "' is missing epsilon_r (implicit defaults are disabled).");
+        }
+        m.epsilon_r = node["epsilon_r"].as<double>();
+        if (!std::isfinite(m.epsilon_r) || m.epsilon_r <= 0.0) {
+            throw std::runtime_error(
+                "Material '" + name + "' has invalid epsilon_r=" +
+                std::to_string(m.epsilon_r) +
+                " (must be finite and > 0).");
+        }
 
         cfg.materials[name] = m;
     }
 }
+
+static std::unordered_set<std::string>
+collect_fieldcage_auto_assigned_boundaries(const YAML::Node &root)
+{
+    std::unordered_set<std::string> out;
+    const YAML::Node fc = root["fieldcage_network"];
+    if (!fc || !fc.IsMap()) {
+        return out;
+    }
+    const bool enabled = fc["enabled"] ? fc["enabled"].as<bool>(true) : true;
+    if (!enabled) {
+        return out;
+    }
+
+    const YAML::Node nodes = fc["nodes"];
+    if (!nodes || !nodes.IsSequence()) {
+        return out;
+    }
+
+    for (std::size_t i = 0; i < nodes.size(); ++i) {
+        const YAML::Node nd = nodes[i];
+        if (!nd || !nd.IsMap()) continue;
+        const bool fixed = nd["fixed"] ? nd["fixed"].as<bool>(false) : false;
+        if (fixed) continue;
+        const std::string bname = nd["boundary"] ? nd["boundary"].as<std::string>("") : "";
+        if (!bname.empty()) {
+            out.insert(bname);
+        }
+    }
+    return out;
+}
+
 static void parse_boundary_params(Config &cfg, const YAML::Node &root)
 {
     const auto bnds = root["boundaries"];
     if (!bnds) return;
+    const auto fieldcage_auto = collect_fieldcage_auto_assigned_boundaries(root);
 
     for (const auto &it : bnds) {
         std::string name = it.first.as<std::string>();
@@ -734,13 +806,51 @@ static void parse_boundary_params(Config &cfg, const YAML::Node &root)
         Boundary b;
         b.bdr_id = node["bdr_id"].as<int>(-1);
         b.type   = node["type"].as<std::string>("dirichlet");
-        b.value  = node["value"].as<double>(0.0);
 
         b.depth_dependent = node["depth_dependent"].as<bool>(b.depth_dependent);
-        b.z_bot           = node["z_bot"].as<double>(b.z_bot);
-        b.z_top           = node["z_top"].as<double>(b.z_top);
-        b.value_bot       = node["value_bot"].as<double>(b.value_bot);
-        b.value_top       = node["value_top"].as<double>(b.value_top);
+        std::string type_l = b.type;
+        std::transform(type_l.begin(), type_l.end(), type_l.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+        const bool auto_fieldcage_dirichlet =
+            (type_l == "dirichlet") && (fieldcage_auto.find(name) != fieldcage_auto.end());
+
+        if (type_l == "dirichlet" || type_l == "neumann") {
+            if (node["value"]) {
+                b.value = node["value"].as<double>();
+                if (!std::isfinite(b.value)) {
+                    throw std::runtime_error(
+                        "Boundary '" + name + "' has non-finite scalar value.");
+                }
+            } else if (!b.depth_dependent && !auto_fieldcage_dirichlet) {
+                throw std::runtime_error(
+                    "Boundary '" + name +
+                    "' is missing explicit scalar value (implicit defaults are disabled).");
+            }
+        }
+
+        if (b.depth_dependent) {
+            if (!node["z_bot"] || !node["z_top"] || !node["value_bot"] || !node["value_top"]) {
+                throw std::runtime_error(
+                    "Boundary '" + name +
+                    "' is depth-dependent and requires z_bot, z_top, value_bot, and value_top.");
+            }
+            b.z_bot     = node["z_bot"].as<double>();
+            b.z_top     = node["z_top"].as<double>();
+            b.value_bot = node["value_bot"].as<double>();
+            b.value_top = node["value_top"].as<double>();
+
+            if (!std::isfinite(b.z_bot) || !std::isfinite(b.z_top) ||
+                !std::isfinite(b.value_bot) || !std::isfinite(b.value_top)) {
+                throw std::runtime_error(
+                    "Boundary '" + name + "' has non-finite depth-dependent parameters.");
+            }
+        } else {
+            b.z_bot     = node["z_bot"] ? node["z_bot"].as<double>(b.z_bot) : b.z_bot;
+            b.z_top     = node["z_top"] ? node["z_top"].as<double>(b.z_top) : b.z_top;
+            b.value_bot = node["value_bot"] ? node["value_bot"].as<double>(b.value_bot) : b.value_bot;
+            b.value_top = node["value_top"] ? node["value_top"].as<double>(b.value_top) : b.value_top;
+        }
 
         if (b.bdr_id <= 0)
             throw std::runtime_error("Boundary '" + name + "' is missing a valid bdr_id");
@@ -777,12 +887,29 @@ static Config _LoadFromNode(const YAML::Node &root, Config cfg) {
 
   // --- Results save path 
   if (!root["save_path"]) {
-    throw std::runtime_error("Config error: missing mandatory field 'save_path'");
+    std::ostringstream oss;
+    oss << "Config error: missing mandatory field 'save_path'";
+    if (!root || !root.IsMap()) {
+      oss << " (root is not a YAML map)";
+    } else {
+      oss << " (top-level keys:";
+      bool any = false;
+      for (auto it = root.begin(); it != root.end(); ++it) {
+        std::string k;
+        try { k = it->first.as<std::string>(); } catch (...) { k = "<non-scalar-key>"; }
+        oss << (any ? ", " : " ") << k;
+        any = true;
+      }
+      if (!any) oss << " <none>";
+      oss << ")";
+    }
+    throw std::runtime_error(oss.str());
   }
   cfg.save_path = root["save_path"].as<std::string>();
   cfg.delete_files_present = root["delete_files_present"].as<bool>(false);
 
   parse_debug_settings(cfg, root);
+  parse_voltage_settings(cfg, root);
 
   parse_mesh_params(cfg, root);
 
@@ -821,7 +948,7 @@ static Config _LoadFromNode(const YAML::Node &root) {
 // -----------------------------------------------------------------------------
 // Public loaders
 // -----------------------------------------------------------------------------
-std::string ReadConfigString(const std::string& path, MPI_Comm comm = MPI_COMM_WORLD)
+std::string ReadConfigString(const std::string& path, MPI_Comm comm)
 {
     int rank = 0;
     MPI_Comm_rank(comm, &rank);
@@ -863,7 +990,9 @@ std::string ReadConfigString(const std::string& path, MPI_Comm comm = MPI_COMM_W
 
         // Keep ranks aligned before throwing
         MPI_Barrier(comm);
-        //Error(err);
+        throw std::runtime_error(err.empty()
+                                     ? "Config::Load: unknown config read error"
+                                     : err);
     }  
 
     // Broadcast payload size then payload bytes
@@ -878,6 +1007,11 @@ std::string ReadConfigString(const std::string& path, MPI_Comm comm = MPI_COMM_W
     }
     if (n > 0) {
         MPI_Bcast(out.data(), static_cast<int>(n), MPI_CHAR, 0, comm);
+    }
+
+    if (out.empty()) {
+        MPI_Barrier(comm);
+        throw std::runtime_error("Config::Load: config file is empty: " + path);
     }
 
     MPI_Barrier(comm);
@@ -935,47 +1069,147 @@ void apply_fieldcage_network(Config &cfg)
         return;
     }
 
+    auto fail = [](const std::string &msg) -> void {
+        throw std::runtime_error("FieldCageNetwork: " + msg);
+    };
+
     const auto &nodes = fc.nodes;
     const auto &edges = fc.edges;
     const auto &Rvals = fc.R_values;
 
-    // Check that there are nodes
     const int N = static_cast<int>(nodes.size());
-    if (N == 0 || edges.empty()) {
-        return;
+    if (N == 0) {
+        fail("enabled but no nodes are configured");
+    }
+    if (edges.empty()) {
+        fail("enabled but no edges are configured");
     }
 
-    // make map: node name -> index
+    // Map node name -> index
     std::unordered_map<std::string, int> node_index;
     node_index.reserve(N);
     for (int i = 0; i < N; ++i) {
         const std::string &name = nodes[i].name;
+        if (name.empty()) {
+            fail("node[" + std::to_string(i) + "] has an empty name");
+        }
         auto [it, inserted] = node_index.emplace(name, i);
         if (!inserted) {
-            throw std::runtime_error(
-                "FieldCageNetwork: duplicate node name '" + name + "'");
+            fail("duplicate node name '" + name + "'");
         }
     }
 
-    // Classify fixed vs free nodes and read fixed potential
+    struct ValidEdge
+    {
+        int ni = -1;
+        int nj = -1;
+        double conductance = 0.0;
+    };
+
+    std::vector<ValidEdge> valid_edges;
+    valid_edges.reserve(edges.size());
+    std::vector<std::vector<int>> adjacency(N);
+
+    for (const auto &e : edges) {
+        auto it1 = node_index.find(e.n1);
+        auto it2 = node_index.find(e.n2);
+        if (it1 == node_index.end() || it2 == node_index.end()) {
+            fail("edge (" + e.n1 + ", " + e.n2 + ") refers to an unknown node");
+        }
+
+        auto itR = Rvals.find(e.R_name);
+        if (itR == Rvals.end()) {
+            fail("edge (" + e.n1 + ", " + e.n2 + ") uses unknown resistor '" + e.R_name + "'");
+        }
+
+        const double R = itR->second;
+        if (!(R > 0.0) || !std::isfinite(R)) {
+            fail("resistor '" + e.R_name + "' must be finite and > 0");
+        }
+
+        const int ni = it1->second;
+        const int nj = it2->second;
+        valid_edges.push_back(ValidEdge{ni, nj, 1.0 / R});
+        adjacency[ni].push_back(nj);
+        adjacency[nj].push_back(ni);
+    }
+
+    // Classify fixed/free nodes and read fixed potentials
     std::vector<bool>  is_fixed(N, false);
     std::vector<double> V_fixed(N, 0.0);
-  
+
     for (int i = 0; i < N; ++i) {
         const auto &nd = nodes[i];
         if (!nd.fixed) continue;
+
         if (nd.boundary.empty()) {
-            std::cerr << "FieldCageNetwork: fixed node '"<< nd.name << "' has no boundary assigned" << std::endl;
+            fail("fixed node '" + nd.name + "' has no boundary assigned");
         }
+
         auto itb = cfg.boundaries.find(nd.boundary);
         if (itb == cfg.boundaries.end()) {
-            std::cerr << "FieldCageNetwork: fixed node '"<< nd.name << "' refers to unknown boundary '" << nd.boundary << "'" << std::endl;
+            fail("fixed node '" + nd.name + "' refers to unknown boundary '" + nd.boundary + "'");
         }
+
         is_fixed[i] = true;
         V_fixed[i]  = itb->second.value;
     }
 
-    // Build list of free nodes and make map node_index -> free_index
+    // Floating check: each connected component must have at least one fixed node.
+    std::vector<int> visited(N, 0);
+    std::vector<std::string> floating_nodes;
+
+    for (int start = 0; start < N; ++start) {
+        if (visited[start]) continue;
+
+        std::vector<int> stack;
+        std::vector<int> component;
+        stack.push_back(start);
+        visited[start] = 1;
+
+        bool component_has_fixed = false;
+        while (!stack.empty()) {
+            const int v = stack.back();
+            stack.pop_back();
+            component.push_back(v);
+            if (is_fixed[v]) component_has_fixed = true;
+
+            for (int nb : adjacency[v]) {
+                if (!visited[nb]) {
+                    visited[nb] = 1;
+                    stack.push_back(nb);
+                }
+            }
+        }
+
+        if (!component_has_fixed) {
+            for (int idx : component) {
+                floating_nodes.push_back(nodes[idx].name);
+            }
+        }
+    }
+
+    if (!floating_nodes.empty()) {
+        std::sort(floating_nodes.begin(), floating_nodes.end());
+        floating_nodes.erase(std::unique(floating_nodes.begin(), floating_nodes.end()),
+                             floating_nodes.end());
+
+        std::ostringstream oss;
+        oss << "floating nodes after resistor-chain assignment (no fixed anchor in component): ";
+        for (std::size_t i = 0; i < floating_nodes.size(); ++i) {
+            if (i) oss << ", ";
+            oss << floating_nodes[i];
+        }
+
+        if (cfg.voltage.error_on_floating_after_resistor_chain) {
+            fail(oss.str());
+        } else {
+            Warning("FieldCageNetwork: " + oss.str());
+            return;
+        }
+    }
+
+    // Build list of free nodes and map node_index -> free_index
     std::vector<int> free_nodes;
     free_nodes.reserve(N);
     for (int i = 0; i < N; ++i) {
@@ -983,37 +1217,27 @@ void apply_fieldcage_network(Config &cfg)
     }
 
     const int Nf = static_cast<int>(free_nodes.size());
-    if (Nf == 0) std::cerr << "No circuit values to compute. Assuming a configuration mistake" << std::endl;
+    if (Nf == 0) {
+        // All nodes are fixed; just mirror fixed values into boundaries.
+        for (int i = 0; i < N; ++i) {
+            const auto &nd = nodes[i];
+            if (nd.boundary.empty()) continue;
+            auto itb = cfg.boundaries.find(nd.boundary);
+            if (itb == cfg.boundaries.end()) {
+                fail("node '" + nd.name + "' refers to unknown boundary '" + nd.boundary + "'");
+            }
+            itb->second.value = V_fixed[i];
+        }
+        return;
+    }
 
-    // get free index per node -1 if fixed
+    // free index per node (-1 if fixed)
     std::vector<int> free_index_of_node(N, -1);
     for (int k = 0; k < Nf; ++k) {
         free_index_of_node[free_nodes[k]] = k;
     }
 
-    /*
-    Solve Kirchhoff current law 
-    I_in = I_out -> sum_(neighbors to m) V_n/R_nm - V_m/R_nm= 0 
-    Written as 
-    Ax = b 
-    With 
-    A = 1/R 
-    x = Voltages
-    b = Fixed node contributions 
-
-    Solve using Gaussian Elimination
-
-    If i,j both free:
-      A[i,i] += G
-      A[j,j] += G
-      A[i,j] -= G
-      A[j,i] -= G
-    
-    If i free, j fixed:
-      A[i,i] += G
-      b[i]   += G * V_fixed[j]
-    */
-    // row-major, flat vector
+    // Build Ax=b for free-node voltages
     std::vector<double> A(Nf * Nf, 0.0);
     std::vector<double> b(Nf, 0.0);
 
@@ -1021,22 +1245,10 @@ void apply_fieldcage_network(Config &cfg)
         A[row * Nf + col] += val;
     };
 
-    for (const auto &e : edges) {
-        auto it1 = node_index.find(e.n1);
-        auto it2 = node_index.find(e.n2);
-        if (it1 == node_index.end() || it2 == node_index.end()) std::cerr << "FieldCageNetwork: edge (" << e.n1 << ", " << e.n2 << ") refers to unknown node" << std::endl;
-
-        const int ni = it1->second;
-        const int nj = it2->second;
-
-        auto itR = Rvals.find(e.R_name);
-        if (itR == Rvals.end()) std::cerr << "FieldCageNetwork: unknown resistor name '" << e.R_name << "' in edge (" << e.n1 << ", " << e.n2 + ")" << std::endl;
-
-        const double R = itR->second;
-        if (R <= 0.0) std::cerr << "FieldCageNetwork: non-positive resistance '" << e.R_name << "'" << std::endl;
-
-        const double G = 1.0 / R;
-
+    for (const auto &edge : valid_edges) {
+        const int ni = edge.ni;
+        const int nj = edge.nj;
+        const double G = edge.conductance;
         const int fi = free_index_of_node[ni];
         const int fj = free_index_of_node[nj];
 
@@ -1062,12 +1274,11 @@ void apply_fieldcage_network(Config &cfg)
         }
     }
 
-    // Do gaussian evaluation
+    // Gaussian elimination
     std::vector<double> x = b;
+    const double pivot_tol = 1e-18;
 
-    // Forward elimination
     for (int k = 0; k < Nf; ++k) {
-        // Pivot on column k
         int pivot = k;
         double max_abs = std::fabs(A[k * Nf + k]);
         for (int i = k + 1; i < Nf; ++i) {
@@ -1078,12 +1289,11 @@ void apply_fieldcage_network(Config &cfg)
             }
         }
 
-        if (max_abs == 0.0) {
-            std::cerr <<  "FieldCageNetwork: no unique solution!" << std::endl;
+        if (max_abs <= pivot_tol) {
+            fail("no unique solution (singular linear system) while solving resistor chain");
         }
 
         if (pivot != k) {
-            // swap rows k and pivot in A and x
             for (int j = k; j < Nf; ++j) {
                 std::swap(A[k * Nf + j], A[pivot * Nf + j]);
             }
@@ -1092,7 +1302,6 @@ void apply_fieldcage_network(Config &cfg)
 
         const double Akk = A[k * Nf + k];
 
-        // Eliminate below
         for (int i = k + 1; i < Nf; ++i) {
             double factor = A[i * Nf + k] / Akk;
             if (factor == 0.0) continue;
@@ -1105,17 +1314,20 @@ void apply_fieldcage_network(Config &cfg)
         }
     }
 
-    // Back substite
+    // Back substitute
     for (int i = Nf - 1; i >= 0; --i) {
         double sum = x[i];
         for (int j = i + 1; j < Nf; ++j) {
             sum -= A[i * Nf + j] * x[j];
         }
-        double Aii = A[i * Nf + i];
+        const double Aii = A[i * Nf + i];
+        if (std::fabs(Aii) <= pivot_tol) {
+            fail("no unique solution (zero diagonal during back substitution)");
+        }
         x[i] = sum / Aii;
     }
 
-    // Assemlbe Voltage vector
+    // Assemble voltage vector
     std::vector<double> V(N, 0.0);
     for (int i = 0; i < N; ++i) {
         if (is_fixed[i]) {
@@ -1127,11 +1339,14 @@ void apply_fieldcage_network(Config &cfg)
         V[ni] = x[k];
     }
 
-    // Write to cfg.boundaries
+    // Write voltages back to boundary map
     for (int i = 0; i < N; ++i) {
         const auto &nd = nodes[i];
         if (nd.boundary.empty()) continue;
         auto itb = cfg.boundaries.find(nd.boundary);
+        if (itb == cfg.boundaries.end()) {
+            fail("node '" + nd.name + "' refers to unknown boundary '" + nd.boundary + "'");
+        }
         itb->second.value = V[i];
     }
 }
