@@ -1,0 +1,103 @@
+diff --git a/src/TriangleInsertion.cpp b/src/TriangleInsertion.cpp
+index bc4b168..1ca369f 100644
+--- a/src/TriangleInsertion.cpp
++++ b/src/TriangleInsertion.cpp
+@@ -35,6 +35,7 @@
+ #endif
+ 
+ #include <bitset>
++#include <chrono>
+ #include <numeric>
+ #include <unordered_map>
+ 
+@@ -340,54 +341,44 @@ void floatTetWild::insert_triangles_aux(const std::vector<Vector3>&  input_verti
+     //    }
+ 
+     //////
++    using ProgressClock = std::chrono::steady_clock;
++
++    const auto  insertion_start      = ProgressClock::now();
++    auto        last_progress_report = insertion_start;
++    std::size_t last_progress_face   = 0;
++
++    constexpr auto progress_interval = std::chrono::minutes(10);
++
+     for (int i = 0; i < sorted_f_ids.size(); i++) {
+-        // fortest
+-        if (!is_again && i > 0 && i % 1000 == 0) {
+-            logger().debug("inserting f{}... {} failed", i, cnt_fail);
+-            logger().debug("snapped {}/{}", cnt_snapped, cnt_total);
+-            logger().debug("\t- time_find_cutting_tets = {}s (total {}s)",
+-                           time_find_cutting_tets - old_time_find_cutting_tets,
+-                           time_find_cutting_tets);
+-            //            logger().info("\t\t- time_find_cutting_tets1 = {}s",
+-            //            time_find_cutting_tets1); logger().info("\t\t- time_find_cutting_tets2 =
+-            //            {}s", time_find_cutting_tets2); logger().info("\t\t-
+-            //            time_find_cutting_tets3 = {}s", time_find_cutting_tets3);
+-            //            logger().info("\t\t- time_find_cutting_tets4 = {}s",
+-            //            time_find_cutting_tets4);
+-            logger().debug("\t- time_cut_mesh = {}s (total {}s)",
+-                           time_cut_mesh - old_time_cut_mesh,
+-                           time_cut_mesh);
+-            //            logger().info("\t\t- time_cut_mesh1 = {}s", time_cut_mesh1);
+-            //            logger().info("\t\t- time_cut_mesh2 = {}s", time_cut_mesh2);
+-            //            print_times1();
+-            logger().debug(
+-              "\t- time_get_intersecting_edges_and_points = {}s (total {}s)",
+-              time_get_intersecting_edges_and_points - old_time_get_intersecting_edges_and_points,
+-              time_get_intersecting_edges_and_points);
+-            print_times1();
+-            logger().debug("\t- time_subdivide_tets = {}s (total {}s)",
+-                           time_subdivide_tets - old_time_subdivide_tets,
+-                           time_subdivide_tets);
+-            logger().debug("\t- time_push_new_tets = {}s (total {}s)",
+-                           time_push_new_tets - old_time_push_new_tets,
+-                           time_push_new_tets);
+-            //            logger().info("\t\t- time_push_new_tets1 = {}s", time_push_new_tets1);
+-            //            logger().info("\t\t- time_push_new_tets2 = {}s", time_push_new_tets2);
+-            //            logger().info("\t\t- time_push_new_tets3 = {}s", time_push_new_tets3);
+-            logger().debug("\t- time_simplify_subdivision_result = {}s (total {}s)",
+-                           time_simplify_subdivision_result - old_time_simplify_subdivision_result,
+-                           time_simplify_subdivision_result);
+-
+-            old_time_find_cutting_tets                 = time_find_cutting_tets;
+-            old_time_cut_mesh                          = time_cut_mesh;
+-            old_time_get_intersecting_edges_and_points = time_get_intersecting_edges_and_points;
+-            old_time_subdivide_tets                    = time_subdivide_tets;
+-            old_time_push_new_tets                     = time_push_new_tets;
+-            old_time_simplify_subdivision_result       = time_simplify_subdivision_result;
+-            logger().debug("#v = {}/{}", mesh.get_v_num(), mesh.tet_vertices.size());
+-            logger().debug("#t = {}/{}", mesh.get_t_num(), mesh.tets.size());
++        const auto now = ProgressClock::now();
++
++        if (!is_again && now - last_progress_report >= progress_interval) {
++            const std::size_t current_face = static_cast<std::size_t>(i);
++            const std::size_t recent_faces = current_face - last_progress_face;
++
++            const double recent_seconds =
++              std::chrono::duration<double>(now - last_progress_report).count();
++            const double elapsed_hours =
++              std::chrono::duration<double>(now - insertion_start).count() / 3600.0;
++
++            logger().info(
++              "triangle insertion progress: face {}/{}, "
++              "{:.1f} faces/s recently, {:.2f} h elapsed, "
++              "attempted {}, snapped {}, failed {}, "
++              "stored vertices {}, stored tets {}",
++              current_face,
++              sorted_f_ids.size(),
++              recent_faces / recent_seconds,
++              elapsed_hours,
++              cnt_total,
++              cnt_snapped,
++              cnt_fail,
++              mesh.tet_vertices.size(),
++              mesh.tets.size());
++
++            last_progress_face   = current_face;
++            last_progress_report = now;
+         }
+-        // fortest
+ 
+         //        //fortest
+         //        if(i>0 && i%10000 == 0) {

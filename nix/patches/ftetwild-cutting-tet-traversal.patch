@@ -1,0 +1,818 @@
+diff -ruN -x '*.orig' -x '*.rej' a/src/CutMesh.cpp b/src/CutMesh.cpp
+--- a/src/CutMesh.cpp	1970-01-01 01:00:01.000000000 +0100
++++ b/src/CutMesh.cpp	2026-08-04 08:15:06.143034986 +0200
+@@ -40,7 +40,111 @@
+     logger().debug("\t\t- time_get_intersecting_edges_and_points4 = {}s", time_get_intersecting_edges_and_points4);
+ }
+ 
++namespace {
++struct CutMeshExpandScratch {
++    std::vector<bool> in_cutmesh;
++    std::vector<int>  in_cutmesh_t_ids;
++    std::vector<bool> visited;
++    std::vector<int>  visited_t_ids;
++    std::vector<bool> interior;
++    std::vector<int>  interior_v_ids;
++
++    void reset_in_cutmesh(std::size_t tet_count)
++    {
++        for (int t_id : in_cutmesh_t_ids)
++            in_cutmesh[static_cast<std::size_t>(t_id)] = false;
++
++        in_cutmesh_t_ids.clear();
++
++        if (in_cutmesh.size() < tet_count)
++            in_cutmesh.resize(tet_count, false);
++    }
++
++    void reset_visited(std::size_t tet_count)
++    {
++        for (int t_id : visited_t_ids)
++            visited[static_cast<std::size_t>(t_id)] = false;
++
++        visited_t_ids.clear();
++
++        if (visited.size() < tet_count)
++            visited.resize(tet_count, false);
++    }
++
++    void reset_interior(std::size_t vertex_count)
++    {
++        for (int v_id : interior_v_ids)
++            interior[static_cast<std::size_t>(v_id)] = false;
++
++        interior_v_ids.clear();
++
++        if (interior.size() < vertex_count)
++            interior.resize(vertex_count, false);
++    }
++
++    void mark_in_cutmesh(int t_id)
++    {
++        const std::size_t index = static_cast<std::size_t>(t_id);
++        if (in_cutmesh[index])
++            return;
++
++        in_cutmesh[index] = true;
++        in_cutmesh_t_ids.push_back(t_id);
++    }
++
++    bool visit_once(int t_id)
++    {
++        const std::size_t index = static_cast<std::size_t>(t_id);
++        if (visited[index])
++            return false;
++
++        visited[index] = true;
++        visited_t_ids.push_back(t_id);
++        return true;
++    }
++
++    void mark_interior(int v_id)
++    {
++        const std::size_t index = static_cast<std::size_t>(v_id);
++        if (interior[index])
++            return;
++
++        interior[index] = true;
++        interior_v_ids.push_back(v_id);
++    }
++};
++
++struct CutMeshEdgeScratch {
++    std::vector<std::array<int, 2>> edges;
++    std::vector<int>                edge_v_ids;
++
++    void reset()
++    {
++        edges.clear();
++        edge_v_ids.clear();
++    }
++};
++}  // namespace
++
++void floatTetWild::CutMeshStorage::reset()
++{
++    v_ids.clear();
++    map_v_ids.clear();
++    tets.clear();
++    to_plane_dists.clear();
++    is_snapped.clear();
++    is_projected.clear();
++}
++
++floatTetWild::CutMeshStorage& floatTetWild::get_thread_local_cut_mesh_storage()
++{
++    static thread_local CutMeshStorage storage;
++    return storage;
++}
++
+ void floatTetWild::CutMesh::construct(const std::vector<int>& cut_t_ids) {
++    storage.reset();
++
+     v_ids.reserve(cut_t_ids.size() * 4);
+     for (int t_id:cut_t_ids) {
+         for (int j = 0; j < 4; j++)
+@@ -48,6 +152,7 @@
+     }
+     vector_unique(v_ids);
+ 
++    map_v_ids.reserve(v_ids.size());
+     for (int i = 0; i < v_ids.size(); i++)
+         map_v_ids[v_ids[i]] = i;
+ 
+@@ -103,13 +208,13 @@
+     bool snapped = false;
+     to_plane_dists.resize(map_v_ids.size());
+     is_snapped.resize(map_v_ids.size());
+-    for (auto &v:map_v_ids) {
+-        int v_id = v.first;
+-        int lv_id = v.second;
++    for (int lv_id = 0; lv_id < v_ids.size(); lv_id++) {
++        const int v_id = v_ids[lv_id];
+ 
+         int ori = Predicates::orient_3d(p_vs[0], p_vs[1], p_vs[2], mesh.tet_vertices[v_id].pos);
+         if (ori == Predicates::ORI_ZERO) {
+             to_plane_dists[lv_id] = 0;
++            is_snapped[lv_id] = false;
+             continue;
+         }
+         to_plane_dists[lv_id] = get_to_plane_dist(mesh.tet_vertices[v_id].pos);
+@@ -317,27 +422,30 @@
+ }
+ 
+ void floatTetWild::CutMesh::expand_new(std::vector<int> &cut_t_ids) {
++    static thread_local CutMeshExpandScratch scratch;
+     const int t = get_t(p_vs[0], p_vs[1], p_vs[2]);
+     const std::array<Vector2, 3> tri_2d = {{to_2d(p_vs[0], t), to_2d(p_vs[1], t), to_2d(p_vs[2], t)}};
+ 
+-    std::vector<bool> is_in_cutmesh(mesh.tets.size(), false);
++    scratch.reset_in_cutmesh(mesh.tets.size());
++    auto& is_in_cutmesh = scratch.in_cutmesh;
+     for (int t_id:cut_t_ids)
+-        is_in_cutmesh[t_id] = true;
++        scratch.mark_in_cutmesh(t_id);
+ 
+     int cnt_loop=0;
+-    std::vector<bool> is_interior(v_ids.size(), false);
++    scratch.reset_interior(v_ids.size());
++    auto& is_interior = scratch.interior;
+     while (true) {
+         cnt_loop++;
+         /////
+-        std::vector<bool> is_visited(mesh.tets.size(), false);
++        scratch.reset_visited(mesh.tets.size());
++        auto& is_visited = scratch.visited;
+         for (int t_id:cut_t_ids)
+-            is_visited[t_id] = true;
++            scratch.visit_once(t_id);
+ 
+         /////
+         int old_cut_t_ids = cut_t_ids.size();
+-        for (auto m: map_v_ids) {
+-            int gv_id = m.first;
+-            int lv_id = m.second;
++        for (int lv_id = 0; lv_id < v_ids.size(); lv_id++) {
++            const int gv_id = v_ids[lv_id];
+ 
+             if (is_interior[lv_id])
+                 continue;
+@@ -354,7 +462,7 @@
+ 
+                 if (is_visited[gt_id])
+                     continue;
+-                is_visited[gt_id] = true;
++                scratch.visit_once(gt_id);
+ 
+                 ///
+                 int cnt = 0;
+@@ -403,7 +511,7 @@
+ 
+                 ///
+                 cut_t_ids.push_back(gt_id);
+-                is_in_cutmesh[gt_id] = true;
++                scratch.mark_in_cutmesh(gt_id);
+ 
+                 ///
+                 tets.emplace_back();
+@@ -414,9 +522,10 @@
+                     if (map_v_ids.find(new_gv_id) == map_v_ids.end()) {
+                         //
+                         v_ids.push_back(new_gv_id);
+-                        is_interior.push_back(false);
+                         new_lv_id = v_ids.size() - 1;
+                         map_v_ids[new_gv_id] = new_lv_id;
++                        if (is_interior.size() < v_ids.size())
++                            is_interior.resize(v_ids.size(), false);
+                         //
+                         double dist = get_to_plane_dist(mesh.tet_vertices[new_gv_id].pos);
+                         int ori = Predicates::orient_3d(p_vs[0], p_vs[1], p_vs[2], mesh.tet_vertices[new_gv_id].pos);
+@@ -439,7 +548,7 @@
+                 }
+             }
+             if (is_in)
+-                is_interior[lv_id] = true;
++                scratch.mark_interior(lv_id);
+         }
+         if (cut_t_ids.size() == old_cut_t_ids)
+             break;
+@@ -505,9 +614,10 @@
+ 
+ int floatTetWild::CutMesh::project_to_plane(int input_vertices_size) {
+     is_projected.resize(v_ids.size(), false);
++    std::fill(is_projected.begin(), is_projected.end(), false);
+ 
+     int cnt = 0;
+-    for (int i = 0; i < is_snapped.size(); i++) {
++    for (int i = 0; i < v_ids.size(); i++) {
+         if (!is_snapped[i] || is_projected[i])
+             continue;
+         if (v_ids[i] < input_vertices_size)
+@@ -569,7 +679,11 @@
+ bool floatTetWild::CutMesh::get_intersecting_edges_and_points(std::vector<Vector3> &points,
+                                                               std::map<std::array<int, 2>, int>& map_edge_to_intersecting_point,
+                                                               std::vector<int>& subdivide_t_ids) {
+-    std::vector<std::array<int, 2>> edges;
++    static thread_local CutMeshEdgeScratch scratch;
++    scratch.reset();
++
++    auto& edges = scratch.edges;
++    edges.reserve(tets.size() * 6);
+     for (auto &t: tets) {
+         for (int j = 0; j < 3; j++) {
+             std::array<int, 2> e;
+@@ -586,7 +700,8 @@
+     }
+     vector_unique(edges);
+ 
+-    std::vector<int> e_v_ids;
++    auto& e_v_ids = scratch.edge_v_ids;
++    e_v_ids.reserve(edges.size() * 2);
+     for (int i = 0; i < edges.size(); i++) {
+         const auto &e = edges[i];
+         if (is_v_on_plane(e[0]) || is_v_on_plane(e[1]))
+@@ -685,9 +800,8 @@
+     return true;
+ 
+     bool is_good = true;
+-    for (auto &m:map_v_ids) {
+-        int gv_id = m.first;
+-        int lv_id = m.second;
++    for (int lv_id = 0; lv_id < v_ids.size(); lv_id++) {
++        int gv_id = v_ids[lv_id];
+ 
+         Scalar dist = get_to_plane_dist(mesh.tet_vertices[gv_id].pos);
+         if (std::fabs(dist) < mesh.params.eps_coplanar && to_plane_dists[lv_id] != 0 && !is_snapped[lv_id]) {
+@@ -699,4 +813,4 @@
+         }
+     }
+     return is_good;
+-}
+\ No newline at end of file
++}
+diff -ruN -x '*.orig' -x '*.rej' a/src/CutMesh.h b/src/CutMesh.h
+--- a/src/CutMesh.h	1970-01-01 01:00:01.000000000 +0100
++++ b/src/CutMesh.h	2026-08-04 08:15:06.142947444 +0200
+@@ -13,25 +13,51 @@
+ #ifndef FLOATTETWILD_CUTMESH_H
+ #define FLOATTETWILD_CUTMESH_H
+ 
++#include <unordered_map>
++
+ #include <floattetwild/Mesh.hpp>
+ #include <floattetwild/AABBWrapper.h>
+ 
+ namespace floatTetWild {
+-    class CutMesh {
+-    public:
++    struct CutMeshStorage {
+         std::vector<int> v_ids;
+-        std::map<int, int> map_v_ids;
++        std::unordered_map<int, int> map_v_ids;
+         std::vector<std::array<int, 4>> tets;
+-
+         std::vector<Scalar> to_plane_dists;
+         std::vector<bool> is_snapped;
+         std::vector<bool> is_projected;
+ 
++        void reset();
++    };
++
++    CutMeshStorage& get_thread_local_cut_mesh_storage();
++
++    class CutMesh {
++    public:
++        CutMeshStorage& storage;
++        std::vector<int>& v_ids;
++        std::unordered_map<int, int>& map_v_ids;
++        std::vector<std::array<int, 4>>& tets;
++
++        std::vector<Scalar>& to_plane_dists;
++        std::vector<bool>& is_snapped;
++        std::vector<bool>& is_projected;
++
+         Mesh &mesh;
+         const Vector3 &p_n;
+         const std::array<Vector3, 3> &p_vs;
+ 
+-        CutMesh(Mesh &_mesh, const Vector3 &_p_n, const std::array<Vector3, 3> &_p_vs) :
++        CutMesh(Mesh &_mesh,
++                const Vector3 &_p_n,
++                const std::array<Vector3, 3> &_p_vs,
++                CutMeshStorage& _storage = get_thread_local_cut_mesh_storage()) :
++                storage(_storage),
++                v_ids(storage.v_ids),
++                map_v_ids(storage.map_v_ids),
++                tets(storage.tets),
++                to_plane_dists(storage.to_plane_dists),
++                is_snapped(storage.is_snapped),
++                is_projected(storage.is_projected),
+                 mesh(_mesh), p_n(_p_n), p_vs(_p_vs) {}
+ 
+         void construct(const std::vector<int> &cut_t_ids);
+diff -ruN -x '*.orig' -x '*.rej' a/src/EdgeCollapsing.cpp b/src/EdgeCollapsing.cpp
+--- a/src/EdgeCollapsing.cpp	1970-01-01 01:00:01.000000000 +0100
++++ b/src/EdgeCollapsing.cpp	2026-08-04 08:28:32.857383149 +0200
+@@ -309,6 +309,8 @@
+     set_intersection(tet_vertices[v1_id].conn_tets, tet_vertices[v2_id].conn_tets, n12_t_ids);
+     if (n12_t_ids.empty())
+         return EC_FAIL_INVERSION;
++    for (int t_id : n12_t_ids)
++        validate_tet_id(mesh, t_id, "collapse_an_edge n12_t_ids");
+     //    std::unordered_set<int> n1_t_ids = tet_vertices[v1_id].conn_tets;//v1.conn_tets -
+     //    n12_t_ids for (int t_id:n12_t_ids)
+     //        n1_t_ids.erase(t_id);
+@@ -320,6 +322,8 @@
+                         n12_t_ids.begin(),
+                         n12_t_ids.end(),
+                         std::back_inserter(n1_t_ids));
++    for (int t_id : n1_t_ids)
++        validate_tet_id(mesh, t_id, "collapse_an_edge n1_t_ids");
+ 
+     // inversion
+     std::vector<int> js_n1_t_ids;
+@@ -339,6 +343,7 @@
+     else {
+         if (is_check_quality) {
+             for (int t_id : tet_vertices[v1_id].conn_tets) {
++                validate_tet_id(mesh, t_id, "collapse_an_edge quality conn_tets");
+                 if (tets[t_id].quality > old_max_quality)
+                     old_max_quality = tets[t_id].quality;
+             }
+@@ -502,6 +507,7 @@
+             //            }
+             if (pair.size() > 1) {
+                 int opp_t_id = pair[0] == t_id ? pair[1] : pair[0];
++                validate_tet_id(mesh, opp_t_id, "collapse_an_edge opposite tet");
+                 for (int j = 0; j < 4; j++) {
+                     if (tets[opp_t_id][j] != tets[t_id][mod4(j12[mod2(i + 1)] + 1)] &&
+                         tets[opp_t_id][j] != tets[t_id][mod4(j12[mod2(i + 1)] + 2)] &&
+@@ -520,6 +526,7 @@
+     ts++;
+     ii = 0;
+     for (int t_id : n1_t_ids) {
++        validate_tet_id(mesh, t_id, "collapse_an_edge update n1_t_ids");
+         int j         = js_n1_t_ids[ii++];
+         tets[t_id][j] = v2_id;
+         //        tet_vertices[v2_id].conn_tets.insert(t_id);
+@@ -528,11 +535,13 @@
+             tet_tss[t_id] = ts;  // update timestamp
+     }
+     for (int t_id : n12_t_ids) {
++        validate_tet_id(mesh, t_id, "collapse_an_edge remove n12_t_ids");
+         tets[t_id].is_removed = true;
+         for (int j = 0; j < 4; j++) {
+-            if (tets[t_id][j] != v1_id)
+-                //                tet_vertices[tets[t_id][j]].conn_tets.erase(t_id);
++            if (tets[t_id][j] != v1_id) {
++                validate_vertex_id(mesh, tets[t_id][j], "collapse_an_edge remove neighbor vertex");
+                 vector_erase(tet_vertices[tets[t_id][j]].conn_tets, t_id);
++            }
+         }
+     }
+ 
+diff -ruN -x '*.orig' -x '*.rej' a/src/LocalOperations.h b/src/LocalOperations.h
+--- a/src/LocalOperations.h	1970-01-01 01:00:01.000000000 +0100
++++ b/src/LocalOperations.h	2026-08-04 08:15:56.716605028 +0200
+@@ -12,6 +12,10 @@
+ #include <floattetwild/Mesh.hpp>
+ #include <floattetwild/AABBWrapper.h>
+ 
++#include <limits>
++#include <sstream>
++#include <stdexcept>
++
+ namespace floatTetWild {
+     extern bool use_old_energy;
+     extern std::string envelope_log_csv;
+@@ -34,6 +38,34 @@
+         return GEO::vec3(p[0], p[1], p[2]);
+     }
+ 
++    inline int narrow_index_or_throw(std::size_t value, const char* context) {
++        if (value > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
++            std::ostringstream stream;
++            stream << context << ": value " << value
++                   << " exceeds INT_MAX " << std::numeric_limits<int>::max();
++            throw std::overflow_error(stream.str());
++        }
++        return static_cast<int>(value);
++    }
++
++    inline void validate_tet_id(const Mesh& mesh, int t_id, const char* context) {
++        if (t_id < 0 || static_cast<std::size_t>(t_id) >= mesh.tets.size()) {
++            std::ostringstream stream;
++            stream << context << ": tet id " << t_id
++                   << " out of range [0, " << mesh.tets.size() << ")";
++            throw std::out_of_range(stream.str());
++        }
++    }
++
++    inline void validate_vertex_id(const Mesh& mesh, int v_id, const char* context) {
++        if (v_id < 0 || static_cast<std::size_t>(v_id) >= mesh.tet_vertices.size()) {
++            std::ostringstream stream;
++            stream << context << ": vertex id " << v_id
++                   << " out of range [0, " << mesh.tet_vertices.size() << ")";
++            throw std::out_of_range(stream.str());
++        }
++    }
++
+     void get_all_edges(const Mesh& mesh, std::vector<std::array<int, 2>>& edges);
+     void get_all_edges(const Mesh& mesh, const std::vector<int>& t_ids, std::vector<std::array<int, 2>>& edges, bool skip_freezed = false);
+ 
+diff -ruN -x '*.orig' -x '*.rej' a/src/TriangleInsertion.cpp b/src/TriangleInsertion.cpp
+--- a/src/TriangleInsertion.cpp	1970-01-01 01:00:01.000000000 +0100
++++ b/src/TriangleInsertion.cpp	2026-08-04 08:18:01.854191708 +0200
+@@ -69,6 +69,68 @@
+ std::vector<std::array<int, 3>> covered_tet_fs;  // fortest
+ // fortest
+ 
++namespace {
++struct CuttingTetTraversalScratch {
++    std::vector<bool> visited;
++    std::vector<int>  touched_t_ids;
++    std::vector<int>  queue_t_ids;
++
++    void reset(std::size_t tet_count)
++    {
++        // Clear only the bits reached by the previous triangle. Keeping the
++        // packed array alive avoids allocating and zeroing mesh.tets.size()
++        // bits for every attempted input face.
++        for (int t_id : touched_t_ids)
++            visited[static_cast<std::size_t>(t_id)] = false;
++
++        touched_t_ids.clear();
++        queue_t_ids.clear();
++
++        // resize() initializes only newly added bits unless capacity growth is
++        // required. Existing storage and queue capacity are retained.
++        if (visited.size() < tet_count)
++            visited.resize(tet_count, false);
++    }
++
++    bool enqueue_once(int t_id)
++    {
++        const std::size_t index = static_cast<std::size_t>(t_id);
++        if (visited[index])
++            return false;
++
++        visited[index] = true;
++        touched_t_ids.push_back(t_id);
++        queue_t_ids.push_back(t_id);
++        return true;
++    }
++};
++
++struct TriangleInsertionWorkScratch {
++    std::vector<int>                             cut_t_ids;
++    std::vector<floatTetWild::Vector3>          points;
++    std::map<std::array<int, 2>, int>           map_edge_to_intersecting_point;
++    std::vector<int>                             subdivide_t_ids;
++    std::vector<int>                             tmp_t_ids;
++    std::vector<bool>                            is_mark_surface;
++    std::vector<floatTetWild::MeshTet>          new_tets;
++    std::vector<std::array<std::vector<int>, 4>> new_track_surface_fs;
++    std::vector<int>                             modified_t_ids;
++
++    void reset()
++    {
++        cut_t_ids.clear();
++        points.clear();
++        map_edge_to_intersecting_point.clear();
++        subdivide_t_ids.clear();
++        tmp_t_ids.clear();
++        is_mark_surface.clear();
++        new_tets.clear();
++        new_track_surface_fs.clear();
++        modified_t_ids.clear();
++    }
++};
++}  // namespace
++
+ /// two places to update quality: snapping tet vertices to plane, push new tets
+ 
+ floatTetWild::Vector3 floatTetWild::get_normal(const Vector3& a, const Vector3& b, const Vector3& c)
+@@ -680,6 +742,9 @@
+   bool                                          is_again)
+ {
+     //    igl::Timer timer;
++    static thread_local TriangleInsertionWorkScratch scratch;
++    scratch.reset();
++
+     std::array<Vector3, 3> vs = {{input_vertices[input_faces[insert_f_id][0]],
+                                   input_vertices[input_faces[insert_f_id][1]],
+                                   input_vertices[input_faces[insert_f_id][2]]}};
+@@ -689,7 +754,7 @@
+ 
+     /////
+     //    timer.start();
+-    std::vector<int> cut_t_ids;
++    auto& cut_t_ids = scratch.cut_t_ids;
+     find_cutting_tets(insert_f_id, input_vertices, input_faces, vs, mesh, cut_t_ids, is_again);
+     //    time_find_cutting_tets += timer.getElapsedTime();
+ 
+@@ -731,9 +796,9 @@
+ 
+     /////
+     //    timer.start();
+-    std::vector<Vector3>              points;
+-    std::map<std::array<int, 2>, int> map_edge_to_intersecting_point;
+-    std::vector<int>                  subdivide_t_ids;
++    auto& points                        = scratch.points;
++    auto& map_edge_to_intersecting_point = scratch.map_edge_to_intersecting_point;
++    auto& subdivide_t_ids               = scratch.subdivide_t_ids;
+     if (!cut_mesh.get_intersecting_edges_and_points(
+           points, map_edge_to_intersecting_point, subdivide_t_ids)) {
+         //        time_get_intersecting_edges_and_points += timer.getElapsedTime();
+@@ -748,13 +813,14 @@
+     //    time_get_intersecting_edges_and_points += timer.getElapsedTime();
+     // have to add all cut_t_ids
+     vector_unique(cut_t_ids);
+-    std::vector<int> tmp;
++    auto& tmp = scratch.tmp_t_ids;
+     std::set_difference(subdivide_t_ids.begin(),
+                         subdivide_t_ids.end(),
+                         cut_t_ids.begin(),
+                         cut_t_ids.end(),
+                         std::back_inserter(tmp));
+-    std::vector<bool> is_mark_surface(cut_t_ids.size(), true);
++    auto& is_mark_surface = scratch.is_mark_surface;
++    is_mark_surface.resize(cut_t_ids.size(), true);
+     cut_t_ids.insert(cut_t_ids.end(), tmp.begin(), tmp.end());
+     is_mark_surface.resize(is_mark_surface.size() + tmp.size(), false);
+     //    cout << "cut_mesh.get_intersecting_edges_and_points OK" << endl;
+@@ -762,9 +828,9 @@
+ 
+     /////
+     //    timer.start();
+-    std::vector<MeshTet>                         new_tets;
+-    std::vector<std::array<std::vector<int>, 4>> new_track_surface_fs;
+-    std::vector<int>                             modified_t_ids;
++    auto& new_tets             = scratch.new_tets;
++    auto& new_track_surface_fs = scratch.new_track_surface_fs;
++    auto& modified_t_ids       = scratch.modified_t_ids;
+     if (!subdivide_tets(insert_f_id,
+                         mesh,
+                         cut_mesh,
+@@ -810,7 +876,11 @@
+     //    igl::Timer timer;
+     //    timer.start();
+     /// vs
+-    const int old_v_size = mesh.tet_vertices.size();
++    const int old_v_size = narrow_index_or_throw(mesh.tet_vertices.size(), "push_new_tets old_v_size");
++    if (!points.empty()) {
++        narrow_index_or_throw(mesh.tet_vertices.size() + points.size() - 1,
++                              "push_new_tets new vertex id");
++    }
+     mesh.tet_vertices.resize(mesh.tet_vertices.size() + points.size());
+     for (int i = 0; i < points.size(); i++) {
+         mesh.tet_vertices[old_v_size + i].pos = points[i];
+@@ -824,18 +894,32 @@
+     //    time_push_new_tets2 += timer.getElapsedTime();
+ 
+     //    timer.start();
++    if (modified_t_ids.size() > new_tets.size()) {
++        throw std::runtime_error("push_new_tets: modified_t_ids larger than new_tets");
++    }
++    if (new_tets.size() > modified_t_ids.size()) {
++        narrow_index_or_throw(mesh.tets.size() + new_tets.size() - modified_t_ids.size() - 1,
++                              "push_new_tets appended tet id");
++    }
+     for (int i = 0; i < new_tets.size(); i++) {
+         //        if (is_again)
+         //            new_tets[i].quality = get_quality(mesh, new_tets[i]);
+ 
+         if (i < modified_t_ids.size()) {
++            validate_tet_id(mesh, modified_t_ids[i], "push_new_tets modified_t_ids");
+             for (int j = 0; j < 4; j++) {
++                validate_vertex_id(mesh,
++                                   mesh.tets[modified_t_ids[i]][j],
++                                   "push_new_tets old tet vertex");
+                 vector_erase(mesh.tet_vertices[mesh.tets[modified_t_ids[i]][j]].conn_tets,
+                              modified_t_ids[i]);
+             }
+             mesh.tets[modified_t_ids[i]]        = new_tets[i];
+             track_surface_fs[modified_t_ids[i]] = new_track_surface_fs[i];
+             for (int j = 0; j < 4; j++) {
++                validate_vertex_id(mesh,
++                                   mesh.tets[modified_t_ids[i]][j],
++                                   "push_new_tets replaced tet vertex");
+                 mesh.tet_vertices[mesh.tets[modified_t_ids[i]][j]].conn_tets.push_back(
+                   modified_t_ids[i]);
+             }
+@@ -847,9 +931,14 @@
+             //                mesh.tet_vertices[mesh.tets.back()[j]].conn_tets.push_back(mesh.tets.size()
+             //                - 1);
+             //            }
++            const int new_tet_id =
++              narrow_index_or_throw(mesh.tets.size() + i - modified_t_ids.size(),
++                                    "push_new_tets appended tet id");
+             for (int j = 0; j < 4; j++) {
+-                mesh.tet_vertices[new_tets[i][j]].conn_tets.push_back(mesh.tets.size() + i -
+-                                                                      modified_t_ids.size());
++                validate_vertex_id(mesh,
++                                   new_tets[i][j],
++                                   "push_new_tets appended tet vertex");
++                mesh.tet_vertices[new_tets[i][j]].conn_tets.push_back(new_tet_id);
+             }
+         }
+         // todo: tags???
+@@ -968,6 +1057,10 @@
+         int  v2_id    = v_ids[1];
+         bool is_valid = true;
+         for (int t_id : mesh.tet_vertices[v1_id].conn_tets) {
++            validate_tet_id(mesh, t_id, "simplify_subdivision_result pre-collapse conn_tets");
++            if (static_cast<std::size_t>(t_id) >= track_surface_fs.size()) {
++                throw std::out_of_range("simplify_subdivision_result: track_surface_fs tet id out of range");
++            }
+             for (int j = 0; j < 4; j++) {
+                 if ((!track_surface_fs[t_id][j].empty() &&
+                      !vector_contains(track_surface_fs[t_id][j], insert_f_id)) ||
+@@ -986,8 +1079,8 @@
+ 
+         std::vector<std::array<int, 2>> new_edges;
+         static const bool               is_check_quality = true;
+-        auto                            v1_conn_tets     = mesh.tet_vertices[v1_id].conn_tets;
+         for (int t_id : mesh.tet_vertices[v1_id].conn_tets) {
++            validate_tet_id(mesh, t_id, "simplify_subdivision_result quality conn_tets");
+             //            if(mesh.tets[t_id].quality == 0)
+             mesh.tets[t_id].quality = get_quality(mesh, t_id);
+         }
+@@ -1074,21 +1167,13 @@
+                                      std::vector<int>&             cut_t_ids,
+                                      bool                          is_again)
+ {
+-    std::vector<bool> is_visited(mesh.tets.size(), false);
+-    std::queue<int>   queue_t_ids;
++    static thread_local CuttingTetTraversalScratch scratch;
++    scratch.reset(mesh.tets.size());
+ 
+     if (!is_again) {
+-        std::vector<int> n_t_ids;
+         for (int j = 0; j < 3; j++) {
+-            n_t_ids.insert(n_t_ids.end(),
+-                           mesh.tet_vertices[input_faces[f_id][j]].conn_tets.begin(),
+-                           mesh.tet_vertices[input_faces[f_id][j]].conn_tets.end());
+-        }
+-        vector_unique(n_t_ids);
+-
+-        for (int t_id : n_t_ids) {
+-            is_visited[t_id] = true;
+-            queue_t_ids.push(t_id);
++            for (int t_id : mesh.tet_vertices[input_faces[f_id][j]].conn_tets)
++                scratch.enqueue_once(t_id);
+         }
+     }
+     else {
+@@ -1116,10 +1201,8 @@
+ 
+             tbb_t_ids.push_back(t_id);
+         });
+-        for (int t_id : tbb_t_ids) {
+-            queue_t_ids.push(t_id);
+-            is_visited[t_id] = true;
+-        }
++        for (int t_id : tbb_t_ids)
++            scratch.enqueue_once(t_id);
+ #else
+         for (int t_id = 0; t_id < mesh.tets.size(); t_id++) {
+             if (mesh.tets[t_id].is_removed)
+@@ -1135,8 +1218,7 @@
+             if (!is_bbox_intersected(min_f, max_f, min_t, max_t))
+                 continue;
+ 
+-            queue_t_ids.push(t_id);
+-            is_visited[t_id] = true;
++            scratch.enqueue_once(t_id);
+         }
+ #endif
+     }
+@@ -1145,9 +1227,9 @@
+     //    std::vector<std::array<int, 4>> visited_results(mesh.tets.size(), {{CUT_UNKNOWN,
+     //    CUT_UNKNOWN, CUT_UNKNOWN, CUT_UNKNOWN}}); const int test_f_id = 771; const int test_f_id =
+     //    -1; const int test_j = 1; const int test_v_id = input_faces[test_f_id][test_j];
+-    while (!queue_t_ids.empty()) {
+-        int t_id = queue_t_ids.front();
+-        queue_t_ids.pop();
++    std::size_t queue_index = 0;
++    while (queue_index < scratch.queue_t_ids.size()) {
++        const int t_id = scratch.queue_t_ids[queue_index++];
+ 
+         if (is_again) {
+             bool is_cut = false;
+@@ -1164,12 +1246,8 @@
+             if (is_cut) {
+                 cut_t_ids.push_back(t_id);
+                 for (int j = 0; j < 4; j++) {
+-                    for (int n_t_id : mesh.tet_vertices[mesh.tets[t_id][j]].conn_tets) {
+-                        if (!is_visited[n_t_id]) {
+-                            is_visited[n_t_id] = true;
+-                            queue_t_ids.push(n_t_id);
+-                        }
+-                    }
++                    for (int n_t_id : mesh.tet_vertices[mesh.tets[t_id][j]].conn_tets)
++                        scratch.enqueue_once(n_t_id);
+                 }
+                 continue;
+             }
+@@ -1193,7 +1271,7 @@
+         //            continue;
+ 
+         bool              is_cutted = false;
+-        std::vector<bool> is_cut_vs = {{false, false, false, false}};  /// is v on cut face
++        std::array<bool, 4> is_cut_vs = {{false, false, false, false}};  /// is v on cut face
+         for (int j = 0; j < 4; j++) {
+             int cnt_pos = 0;
+             int cnt_neg = 0;
+@@ -1434,12 +1512,8 @@
+         for (int j = 0; j < 4; j++) {
+             if (!is_cut_vs[j])
+                 continue;
+-            for (int n_t_id : mesh.tet_vertices[mesh.tets[t_id][j]].conn_tets) {
+-                if (!is_visited[n_t_id]) {
+-                    is_visited[n_t_id] = true;
+-                    queue_t_ids.push(n_t_id);
+-                }
+-            }
++            for (int n_t_id : mesh.tet_vertices[mesh.tets[t_id][j]].conn_tets)
++                scratch.enqueue_once(n_t_id);
+         }
+     }
+ 
+diff -ruN -x '*.orig' -x '*.rej' a/src/external/Predicates.cpp b/src/external/Predicates.cpp
+--- a/src/external/Predicates.cpp	1970-01-01 01:00:01.000000000 +0100
++++ b/src/external/Predicates.cpp	2026-08-04 08:15:06.143603668 +0200
+@@ -5,6 +5,17 @@
+ #include <igl/predicates/predicates.h>
+ 
+ #include <geogram/delaunay/delaunay_3d.h>
++
++namespace {
++void ensure_exact_predicates_initialized() {
++    static const bool initialized = []() {
++        igl::predicates::exactinit();
++        return true;
++    }();
++    (void)initialized;
++}
++}  // namespace
++
+ namespace floatTetWild {
+ #define GEO_PREDICATES false
+     const int Predicates::ORI_POSITIVE;
+@@ -17,7 +28,7 @@
+         const int result = -GEO::PCK::orient_3d(p1.data(), p2.data(), p3.data(), p4.data());
+ #else
+ //		const Scalar result = orient3d(p1.data(), p2.data(), p3.data(), p4.data());
+-        igl::predicates::exactinit();
++        ensure_exact_predicates_initialized();
+         auto res = igl::predicates::orient3d(p1, p2, p3, p4);
+         Scalar result;
+         if(res == igl::predicates::Orientation::POSITIVE)
+@@ -48,7 +59,7 @@
+         const int result = -GEO::PCK::orient_3d(p1.data(), p2.data(), p3.data(), p.data());
+ #else
+ //		const Scalar result = orient3d(p1.data(), p2.data(), p3.data(), p.data());
+-        igl::predicates::exactinit();
++        ensure_exact_predicates_initialized();
+         auto res = igl::predicates::orient3d(p1, p2, p3, p);
+         Scalar result;
+         if(res == igl::predicates::Orientation::POSITIVE)
+@@ -78,7 +89,7 @@
+         const int ori = -GEO::PCK::orient_3d(p1.data(), p2.data(), p3.data(), p4.data());
+ #else
+ //		const Scalar result = orient3d(p1.data(), p2.data(), p3.data(), p4.data());
+-        igl::predicates::exactinit();
++        ensure_exact_predicates_initialized();
+         auto res = igl::predicates::orient3d(p1, p2, p3, p4);
+         Scalar ori;
+         if(res == igl::predicates::Orientation::POSITIVE)
+@@ -99,7 +110,7 @@
+         const int result = -GEO::PCK::orient_2d(p1.data(), p2.data(), p3.data());
+ #else
+ //		const Scalar result = orient2d(p1.data(), p2.data(), p3.data());
+-        igl::predicates::exactinit();
++        ensure_exact_predicates_initialized();
+         auto res = igl::predicates::orient2d(p1, p2, p3);
+         Scalar result;
+         if(res == igl::predicates::Orientation::POSITIVE)

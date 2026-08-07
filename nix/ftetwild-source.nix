@@ -55,6 +55,7 @@ pkgs.runCommandLocal "ftetwild-source-patched" {
   chmod -R u+w "$out"
   patch -d "$out" -p1 < ${./patches/ftetwild-progress.patch}
   patch -d "$out" -p1 < ${./patches/ftetwild-cutting-tet-traversal.patch}
+  patch -d "$out" -p1 < ${./patches/ftetwild-tetid64.patch}
   sed -i 's/if(NOT ''${GMP_FOUND})/if(NOT GMPfTetWild_FOUND)/' "$out/CMakeLists.txt"
   sed -i \
     's/FIND_PACKAGE_HANDLE_STANDARD_ARGS(GMP DEFAULT_MSG GMP_INCLUDE_DIRS GMP_LIBRARIES)/find_package_handle_standard_args(GMPfTetWild DEFAULT_MSG GMP_INCLUDE_DIRS GMP_LIBRARIES GMPXX_LIBRARIES)/' \
